@@ -55,7 +55,23 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Initialize CEM planner
         ## Set up world model reference and determine if using DreamerV3 or SimpleWorldModel
-        pass
+        super(CEMPlanner, self).__init__(cfg)
+        self.world_model = world_model
+        self.action_dim = action_dim
+        self.type = 'cem'
+        self.cfg = cfg
+        self.device = self._cfg.device
+        self.to(self.device)
+
+        # CEM hyperparameters (extract from cfg or set defaults)
+        self.H = getattr(cfg.planner, 'horizon', 12)  # Planning horizon
+        self.K = getattr(cfg.planner, 'num_samples', 100)  # Number of action sequences to sample
+        self.M = getattr(cfg.planner, 'num_elites', 20)  # Number of elite sequences to select
+        self.L = getattr(cfg.planner, 'num_iterations', 3)  # Number of CEM iterations
+        self.alpha = getattr(cfg.planner, 'temperature', 0.1)  # Temperature for updating distribution
+
+        self.action_mean = torch.zeros(self.H, self.action_dim, device=self.cfg.device)  # Initial mean of action distribution
+        self.action_std = torch.ones(self.H, self.action_dim, device=self.cfg.device)  # Initial std of action distribution
         
     def plan(self, initial_state, return_best_sequence=True):
         """
@@ -73,7 +89,33 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Implement CEM planning algorithm
         ## Sample action sequences, evaluate with world model, select elites, update distribution
-        pass
+        # Reset action distribution each planning call to avoid bias from previous plans
+        action_mean = torch.zeros(self.H, self.action_dim, device=self.device)
+        action_std = torch.ones(self.H, self.action_dim, device=self.device)
+        for iteration in range(self.L):
+            # Sample action sequences from the current distribution
+            action_sequences = action_mean + action_std * torch.randn(self.K, self.H, self.action_dim, device=self.device)  # (K, H, action_dim)
+            
+            # Evaluate the sampled action sequences using the world model
+            rewards = self._evaluate_sequences(initial_state, action_sequences)  # (K,)
+            
+            # Select the top M elite sequences based on rewards
+            elite_indices = torch.topk(rewards, self.M).indices  # (M,)
+            elite_action_sequences = action_sequences[elite_indices]  # (M, H, action_dim)
+            
+            # Update the mean and std of the action distribution using the elites
+            new_action_mean = elite_action_sequences.mean(dim=0)  # (H, action_dim)
+            # We could use unbiased=False to avoid NaN when M==1 (avoids division by N-1=0)
+            new_action_std = elite_action_sequences.std(dim=0, unbiased=True).clamp(min=1e-6)  # (H, action_dim)
+            
+            # Smoothly update the distribution parameters with temperature alpha
+            action_mean = self.alpha * new_action_mean + (1 - self.alpha) * action_mean
+            action_std = self.alpha * new_action_std + (1 - self.alpha) * action_std
+            # Track best action sequence and reward for return
+            best_actions = elite_action_sequences[0] if return_best_sequence else action_mean  # (H, action_dim) - best sequence from elites
+            best_reward = rewards[elite_indices[0]]  # Best reward from elites
+
+        return best_actions, best_reward
     
     def _evaluate_sequences(self, initial_state, action_sequences):
         """
@@ -88,7 +130,10 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Route to appropriate evaluation method
         ## Determine if using DreamerV3 or SimpleWorldModel and call appropriate method
-        pass
+        if self.cfg.model_type == 'dreamer':
+            return self._evaluate_sequences_dreamer(initial_state, action_sequences)
+        else:
+            return self._evaluate_sequences_simple(initial_state, action_sequences)
     
     def _evaluate_sequences_dreamer(self, initial_state, action_sequences):
         """
@@ -104,7 +149,20 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Implement CEM planning with SimpleWorldModel
         ## Roll out action sequences using SimpleWorldModel and compute total rewards
-        pass
+        current_state = initial_state['pose']  # (B, pose_dim)
+        # 1. Broadcast current state to match the batch size of action sequences
+        current_state = current_state.expand(action_sequences.shape[0], -1, -1).contiguous()  # (K, pose_dim)
+        # 2. Initialize total rewards tensor on the same device as current_state
+        total_rewards = torch.zeros(action_sequences.shape[0], device=self.cfg.device)  # (K,)
+        # 3. Roll out each action sequence in the world model and accumulate rewards
+        for step in range(self.H):  # Iterate over each step in the horizon
+            action = action_sequences[:, step, :].unsqueeze(1).to(self.cfg.device)  # (K, 1, action_dim)
+            self.world_model.eval()  # Set world model to evaluation mode
+            with torch.no_grad():  # Disable gradient computation for evaluation
+                next_pose_pred, reward_pred = self.world_model.predict_next_pose(current_state, action)  # (K, 1, pose_dim), (K, 1)
+            total_rewards += reward_pred.squeeze(-1)  # Accumulate rewards (K,)
+            current_state = next_pose_pred  # Because next_pose_pred is in the same normalized space expected by the world model for the next step
+        return total_rewards  # (K,)
     
     def forward(self, observations=None, prev_actions=None, prev_state=None,
                 mask_=True, pose=None, last_action=None,
@@ -132,13 +190,31 @@ class CEMPlanner(Planner):
         """
         # TODO: Part 1.3 - Route forward pass to appropriate model
         ## Determine if using DreamerV3 or SimpleWorldModel and call appropriate method
-        pass
+        if self.cfg.model_type == 'dreamer':
+            return self._forward_dreamer(observations, prev_actions, prev_state, return_full_sequence)
+        else:
+            return self._forward_simple(pose, return_full_sequence)
     
     def _forward_dreamer(self, observations, prev_actions, prev_state, return_full_sequence):
         """Forward pass for DreamerV3 model."""
         # TODO: Part 4.2 - Implement DreamerV3 forward pass for policy
         ## Encode observations, roll through RSSM, and plan with policy from current state
         pass
+    
+    def _forward_simple(self, pose, return_full_sequence):
+        """Forward pass for SimpleWorldModel."""
+        # TODO: Part 1.3 - Implement SimpleWorldModel forward pass for policy
+        ## Encode pose, roll through model, and plan with policy from current state
+        #1. Encode pose to get initial state for planning
+        initial_state = {'pose': pose}  # (B, 1, pose_dim)
+        #2. Plan using CEM to get action sequence and predicted reward
+        best_actions_seq, best_reward = self.plan(initial_state)
+        #3. Return the planned action sequence and predicted reward
+        return {
+            'actions': best_actions_seq,  # (H, action_dim) or (action_dim,)
+            'predicted_reward': best_reward,
+            'final_state': initial_state  # Return the initial state used for planning (could also return the final state after rollout if desired)
+        }
 
         # [Imagine method remains mostly the same, ensuring valid input shapes for heads]
     def preprocess_state(self, image):
@@ -171,7 +247,30 @@ class PolicyPlanner(GRPBase):
         """
         # TODO: Part 2.2 - Initialize Policy planner
         ## Set up world model, policy model, optimizer, and scheduler
-        pass
+        super(PolicyPlanner, self).__init__(cfg)
+        self.world_model = world_model
+        self.policy_model = policy_model
+        self.action_dim = action_dim
+        self.type = 'policy'
+        self.cfg = cfg
+        self.device = self.cfg.device
+        self.to(self.device)
+
+        self.H = horizon if horizon is not None else getattr(cfg.planner, 'horizon', 12) # Planning horizon
+        self.optimizer = torch.optim.Adam(self.policy_model.parameters(), lr=getattr(cfg.planner, 'learning_rate', 0.001))
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=10, gamma=0.9)  # Example scheduler, can be configured as needed
+        self.loss_fn = torch.nn.MSELoss()  # Example loss function for behavior cloning, can be changed based on the task
+        self.K = getattr(cfg.planner, 'num_samples', 100)  # Number of action sequences to sample
+        self.M = getattr(cfg.planner, 'num_elites', 20)  # Number of elite sequences to select
+        self.L = getattr(cfg.planner, 'num_iterations', 3)  # Number of CEM iterations
+        self.alpha = getattr(cfg.planner, 'temperature', 0.1)  # Temperature for updating distribution
+        self.training_epochs = getattr(cfg.training, 'num_epochs', 3)  # Small: outer loop already iterates epochs
+        self.batch_size = getattr(cfg, 'batch_size', 64)  # Batch size for training the policy
+
+    def load_policy_model(self, path):
+        """Load pretrained policy model from checkpoint."""
+        self.policy_model.load_state_dict(torch.load(path, map_location=self.device))
+        self.policy_model.eval()  # Set to evaluation mode after loading
 
     def update(self, states, actions):
         """
@@ -184,7 +283,32 @@ class PolicyPlanner(GRPBase):
         """
         # TODO: Part 2.2 - Implement policy training
         ## Train the policy using behavior cloning on collected state-action pairs
-        pass
+        # Check if any poses or actions contain NaNs and print a warning if so (debugging step)
+        if torch.isnan(states).any():
+            print("Warning: NaNs detected in encoded states. Check data preprocessing and encoding.")
+            print(f"NaN count in states: {torch.isnan(states).sum().item()} out of {states.numel()}")
+        if torch.isnan(actions).any():
+            print("Warning: NaNs detected in encoded actions. Check data preprocessing and encoding.")
+            print(f"NaN count in actions: {torch.isnan(actions).sum().item()} out of {actions.numel()}")
+        # Flatten sequence dimension so the policy sees individual (pose -> action) pairs:
+        # (B, T, D) -> (B*T, D).  This matches eval-time where a single step is passed in.
+        if states.dim() == 3:
+            B, T, D = states.shape
+            states  = states.reshape(B * T, D)                    # (B*T, pose_dim)
+            actions = actions.reshape(B * T, self.action_dim)     # (B*T, action_dim)
+
+        # Policy outputs (B, action_dim*2): first half = mean, second half = log_std
+        predicted_actions_distribution = self.policy_model(states)  # (B, action_dim*2)
+        predicted_actions_mean = predicted_actions_distribution[:, :self.action_dim]   # (B, action_dim)
+        predicted_actions_std = predicted_actions_distribution[:, self.action_dim:]  # (B, action_dim)
+        self.optimizer.zero_grad()
+        # Use mean for deterministic behaviour cloning loss
+        loss = self.loss_fn(predicted_actions_mean, actions)  # MSE loss between predicted mean actions and true actions
+        loss.backward()
+        # Clip gradients to prevent large updates from destabilising training
+        # torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        return loss  # Return average loss across epochs for monitoring
 
     
     def plan(self, initial_state, return_best_sequence=True):
@@ -203,7 +327,83 @@ class PolicyPlanner(GRPBase):
         """
         # TODO: Part 2.2 - Implement policy rollout planning
         ## Roll out the policy over the horizon, predicting actions and accumulating rewards
+        current_state = initial_state['pose'] if 'pose' in initial_state else initial_state  # Get the current state (pose for SimpleWorldModel or RSSM state for DreamerV3)   
+        if current_state.dim() == 3:
+            current_state = current_state.squeeze(1)  # (B, pose_dim) or (B, rssm_dim) 
+        action_distribution = self.policy_model(current_state)  # (B, action_dim * 2) because outputting mean and std concatenated
+        action_mean = action_distribution[:, :self.action_dim].unsqueeze(1)  # (B, 1, action_dim)
+        action_std = action_distribution[:, self.action_dim:].unsqueeze(1)  # (B, 1, action_dim)
+        for iteration in range(self.L):
+            # Sample action sequences from the current distribution
+            action_sequences = action_mean + action_std * torch.randn(self.K, self.H, self.action_dim, device=self.device)  # (K, H, action_dim)
+            
+            # Evaluate the sampled action sequences using the world model
+            rewards = self._evaluate_sequences(initial_state, action_sequences)  # (K,)
+            
+            # Select the top M elite sequences based on rewards
+            elite_indices = torch.topk(rewards, self.M).indices  # (M,)
+            elite_action_sequences = action_sequences[elite_indices]  # (M, H, action_dim)
+            
+            # Update the mean and std of the action distribution using the elites
+            new_action_mean = elite_action_sequences.mean(dim=0)  # (H, action_dim)
+            # We could use unbiased=False to avoid NaN when M==1 (avoids division by N-1=0)
+            new_action_std = elite_action_sequences.std(dim=0, unbiased=True).clamp(min=1e-6)  # (H, action_dim)
+            
+            # Smoothly update the distribution parameters with temperature alpha
+            action_mean = self.alpha * new_action_mean + (1 - self.alpha) * action_mean
+            action_std = self.alpha * new_action_std + (1 - self.alpha) * action_std
+            # Track best action sequence and reward for return
+            best_actions = elite_action_sequences[0] if return_best_sequence else action_mean  # (H, action_dim) - best sequence from elites
+            best_reward = rewards[elite_indices[0]]  # Best reward from elites
+
+        return best_actions, best_reward
+
+    def _evaluate_sequences(self, initial_state, action_sequences):
+        """
+        Evaluate a batch of action sequences by rolling them out in the world model.
+        
+        Args:
+            initial_state: Dictionary with initial state (RSSM state for DreamerV3 or pose for SimpleWorldModel)
+            action_sequences: Tensor of shape (num_samples, horizon, action_dim)
+            
+        Returns:
+            rewards: Tensor of shape (num_samples,) with sum of predicted rewards
+        """
+        # TODO: Part 1.3 - Route to appropriate evaluation method
+        ## Determine if using DreamerV3 or SimpleWorldModel and call appropriate method
+        if self.cfg.model_type == 'dreamer':
+            return self._evaluate_sequences_dreamer(initial_state, action_sequences)
+        else:
+            return self._evaluate_sequences_simple(initial_state, action_sequences)
+
+    def _evaluate_sequences_dreamer(self, initial_state, action_sequences):
+        """
+        Evaluate sequences using DreamerV3 RSSM-based rollout.
+        """
+        # TODO: Part 3.3 - Implement CEM planning with DreamerV3
+        ## Roll out action sequences in the DreamerV3 world model and compute total rewards
         pass
+
+    def _evaluate_sequences_simple(self, initial_state, action_sequences):
+        """
+        Evaluate sequences using SimpleWorldModel pose-based rollout.
+        """
+        # TODO: Part 1.3 - Implement CEM planning with SimpleWorldModel
+        ## Roll out action sequences using SimpleWorldModel and compute total rewards
+        current_state = initial_state['pose']  # (B, pose_dim)
+        # 1. Broadcast current state to match the batch size of action sequences
+        current_state = current_state.expand(action_sequences.shape[0], -1, -1).contiguous()  # (K, pose_dim)
+        # 2. Initialize total rewards tensor on the same device as current_state
+        total_rewards = torch.zeros(action_sequences.shape[0], device=self.cfg.device)  # (K,)
+        # 3. Roll out each action sequence in the world model and accumulate rewards
+        for step in range(self.H):  # Iterate over each step in the horizon
+            action = action_sequences[:, step, :].unsqueeze(1).to(self.cfg.device)  # (K, 1, action_dim)
+            self.world_model.eval()  # Set world model to evaluation mode
+            with torch.no_grad():  # Disable gradient computation for evaluation
+                next_pose_pred, reward_pred = self.world_model.predict_next_pose(current_state, action)  # (K, 1, pose_dim), (K, 1)
+            total_rewards += reward_pred.squeeze(-1)  # Accumulate rewards (K,)
+            current_state = next_pose_pred  # Because next_pose_pred is in the same normalized space expected by the world model for the next step
+        return total_rewards  # (K,)
     
     def forward(self, observations=None, prev_actions=None, prev_state=None,
                 mask_=True, pose=None, last_action=None,
@@ -231,7 +431,24 @@ class PolicyPlanner(GRPBase):
         """
         # TODO: Part 2.2 - Route forward pass to appropriate model
         ## Determine if using DreamerV3 or SimpleWorldModel and call appropriate method
-        pass
+        if self.cfg.model_type == 'dreamer':
+            return self._forward_dreamer(observations, prev_actions, prev_state, return_full_sequence)
+        elif self.cfg.model_type == 'simple' and self.cfg.planner.type == 'policy':
+            self.policy_model.eval()  # Set policy model to evaluation mode for planning
+            with torch.no_grad():  # Ensure no gradients are computed during planning
+                # print(f"Shape of input pose: {pose.shape}")  # Debugging print to check input shape
+                actions = self.policy_model(self.world_model.encode_pose(pose.squeeze(1)))  # Get action distribution from policy model
+                # print(f"Shape of policy output: {actions.shape}")  # Debugging print to check output shape
+                action_mean = actions[:, :self.action_dim]  # Extract mean (B, 1, action_dim)
+                action_std = actions[:, self.action_dim:]  # Extract std (B, 1, action_dim)
+                sampled_actions = action_mean  # For deterministic policy; for stochastic, you would sample from the distribution using action_mean and action_std
+            return {
+                'actions': sampled_actions,  # (action_dim,)
+                'predicted_reward': None,  # Predicted reward is not computed here since we're directly using the policy's output; could be computed by rolling out in the world model if desired
+                'final_state': None  # Final state is not computed here
+            }
+        elif self.cfg.model_type == 'simple' and self.cfg.planner.type == 'policy_guided_cem':
+            return self._forward_simple(pose, return_full_sequence)
     
     def _forward_dreamer(self, observations, prev_actions, prev_state, return_full_sequence):
         """Forward pass for DreamerV3 model."""
@@ -241,9 +458,18 @@ class PolicyPlanner(GRPBase):
     
     def _forward_simple(self, pose, return_full_sequence):
         """Forward pass for SimpleWorldModel."""
-        # TODO: Part 2.2 - Implement SimpleWorldModel forward pass for policy
-        ## Plan from current pose using policy with SimpleWorldModel
-        pass
+        # TODO: Part 1.3 - Implement SimpleWorldModel forward pass for policy
+        ## Encode pose, roll through model, and plan with policy from current state
+        #1. Encode pose to get initial state for planning
+        initial_state = {'pose': pose}  # (B, 1, pose_dim)
+        #2. Plan using CEM to get action sequence and predicted reward
+        best_actions_seq, best_reward = self.plan(initial_state)
+        #3. Return the planned action sequence and predicted reward
+        return {
+            'actions': best_actions_seq,  # (H, action_dim) or (action_dim,)
+            'predicted_reward': best_reward,
+            'final_state': initial_state  # Return the initial state used for planning (could also return the final state after rollout if desired)
+        }
 
 
 class RandomPlanner(GRPBase):

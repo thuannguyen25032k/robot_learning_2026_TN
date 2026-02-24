@@ -1,67 +1,120 @@
 import sys
+import os
+from pathlib import Path
+os.environ["MUJOCO_GL"] = "egl"
+# Ensure the vendored LIBERO package is importable even if it hasn't been pip-installed.
+# Hydra may change the working directory, so we resolve relative to this file.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_LIBERO_ROOT = _REPO_ROOT / "LIBERO"
+if _LIBERO_ROOT.exists():
+    sys.path.insert(0, str(_LIBERO_ROOT))
 
 import dill
 from omegaconf import DictConfig, OmegaConf
 import hydra
 import torch
 from torchvision import transforms
-import os
 import h5py
 import numpy as np
 from dreamerV3 import DreamerV3
 from simple_world_model import SimpleWorldModel
 from planning import CEMPlanner, PolicyPlanner, RandomPlanner
 from libero.libero import benchmark, get_libero_path
-from libero.libero.envs import OffScreenRenderEnv, DenseRewardEnv
+from libero.libero.envs import OffScreenRenderEnv
 import random
 from sim_eval import eval_libero
 from collections import deque
+from datasets import load_dataset
+import datasets
+
 
 
 # Factory function to instantiate the correct model
 def create_model(model_type, img_shape, action_dim, device, cfg):
     """
     Factory function to create a world model based on the specified type.
-    
+
     Args:
         model_type: 'dreamer' or 'simple' 
         img_shape: Image shape [C, H, W]
         action_dim: Dimensionality of actions
         device: torch device
         cfg: Configuration object
-        
+
     Returns:
         model: Instantiated model
     """
     if model_type.lower() == 'dreamer':
-        model = DreamerV3(obs_shape=img_shape, action_dim=action_dim, cfg=cfg).to(device)
+        model = DreamerV3(obs_shape=img_shape,
+                          action_dim=action_dim, cfg=cfg).to(device)
     elif model_type.lower() == 'simple':
-        model = SimpleWorldModel(action_dim=action_dim, pose_dim=7, hidden_dim=256, cfg=cfg).to(device)
+        model = SimpleWorldModel(
+            action_dim=action_dim, pose_dim=7, hidden_dim=256, cfg=cfg).to(device)
     else:
-        raise ValueError(f"Unknown model_type: {model_type}. Choose 'dreamer' or 'simple'.")
-    
+        raise ValueError(
+            f"Unknown model_type: {model_type}. Choose 'dreamer' or 'simple'.")
+
     return model
 
+def batch_data(dataset, batch_size, cfg):
+    """
+    Utility function to batch data from the dataset with a fixed sequence length.
+    Args:    
+    dataset: Dataset object that returns (images, actions, rewards, dones, poses)
+    batch_size: Number of sequences per batch
+    sequence_length: Length of each sequence (T)
+
+    Returns:
+    A generator that yields batches of (images, actions, rewards, dones, poses) with shapes:
+    - images: (B, T, C, H, W)
+    - actions: (B, T, 7)
+    - rewards: (B, T)
+    - dones: (B, T)
+    - poses: (B, T, 7)
+    """
+    # Collect sequences for the batch with fixed sequence length
+    print(f"[info] Batching data with batch_size={batch_size}, sequence_length={cfg.policy.sequence_length}")
+    images, actions, rewards, dones, poses = [], [], [], [], []
+    for img, act, rew, don, pos in dataset:
+        images += [img[i:i+cfg.policy.sequence_length] for i in range(0, len(img)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+        actions += [act[i:i+cfg.policy.sequence_length] for i in range(0, len(act)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+        rewards += [rew[i:i+cfg.policy.sequence_length] for i in range(0, len(rew)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+        dones += [don[i:i+cfg.policy.sequence_length] for i in range(0, len(don)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+        poses += [pos[i:i+cfg.policy.sequence_length] for i in range(0, len(pos)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+    images = torch.stack(images)  # (B, T, H, W, C)
+    actions = torch.stack(actions)  # (B, T, action_dim)
+    rewards = torch.stack(rewards)  # (B, T)
+    dones = torch.stack(dones)  # (B, T)
+    poses = torch.stack(poses)  # (B, T, pose_dim)
+    images = images.permute(0, 1, 4, 2, 3).to(cfg.device)  # (B, T, H, W, C) -> (B, T, C, H, W)
+    actions = actions.float().to(cfg.device) # (B, T, action_dim)
+    rewards = rewards.float().to(cfg.device) # (B, T)
+    dones = dones.float().to(cfg.device) # (B, T)
+    poses = poses.float().to(cfg.device) # (B, T, pose_dim)
+    out_dataset = torch.utils.data.TensorDataset(images, actions, rewards, dones, poses)
+    print(f"[info] Created DataLoader with {len(out_dataset)} samples")
+    return torch.utils.data.DataLoader(out_dataset, batch_size=batch_size, shuffle=True)
 
 class ModelTrainingWrapper:
     """
     Wrapper to provide unified interface for training different world models.
     Handles differences in forward passes and loss computation between models.
     """
+
     def __init__(self, model, model_type, device):
         self.model = model
         self.model_type = model_type.lower()
         self.device = device
-        
+
     def forward_pass(self, images, poses, actions):
         """
         Unified forward pass that works with both model types.
-        
+
         Args:
             images: Image tensor (B, T, H, W, C) or None for simple model
             poses: Pose tensor (B, T, 7)
             actions: Action tensor (B, T, 7)
-            
+
         Returns:
             output: Model output (format depends on model type)
         """
@@ -70,11 +123,11 @@ class ModelTrainingWrapper:
         elif self.model_type == 'simple':
             # SimpleWorldModel expects normalized inputs
             return self.model(poses, actions)
-    
-    def compute_loss(self, output, images, rewards, dones, poses, actions ):
+
+    def compute_loss(self, pred_poses, pred_rewards, images, rewards, dones, poses, actions):
         """
         Compute loss in a way that works for both model types.
-        
+
         Args:
             output: Output from forward_pass
             images: Image tensor
@@ -83,7 +136,7 @@ class ModelTrainingWrapper:
             poses: Pose tensor (used for SimpleWorldModel)
             actions: Action tensor (used for SimpleWorldModel)
             pred_coeff, dyn_coeff, rep_coeff: Loss coefficients (used for DreamerV3)
-            
+
         Returns:
             losses: Dictionary with loss information
         """
@@ -91,12 +144,44 @@ class ModelTrainingWrapper:
             # Use DreamerV3 loss computation
             return self.model.compute_loss(
                 output, images, rewards, dones, self.device
-                
+
             )
         elif self.model_type == 'simple':
             # TODO: Part 1.2 - Implement SimpleWorldModel training loss
-            ## Compute MSE loss between predicted and target poses/rewards
-            pass
+            # Compute MSE loss between predicted and target poses/rewards
+            # Ensure rewards are always (B, T)
+            if pred_rewards.dim() == 3 and pred_rewards.shape[-1] == 1:
+                pred_rewards = pred_rewards.squeeze(-1)
+            # Check shape of pred_poses and pred_rewards
+            # print(f"Predicted poses shape: {pred_poses.shape}, Predicted rewards shape: {pred_rewards.shape}")
+            if pred_poses.dim() == 2:
+                print(
+                    f"Warning: Predicted poses have shape {pred_poses.shape}, expected (B, T, 7). Check model output formatting.")
+                raise ValueError("SimpleWorldModel output must be (B, T, 7); got 2D tensor")
+            elif pred_poses.dim() == 3 and pred_poses.shape[2] != 7:
+                print(
+                    f"Warning: Predicted poses have last dimension {pred_poses.shape[2]}, expected 7. Check model output formatting.")
+                raise ValueError("SimpleWorldModel pose dim must be 7")
+            elif pred_poses.dim() == 3 and pred_poses.shape[2] == 7:
+                B, T, _ = pred_poses.shape
+
+                # Align shapes: predict at times [0..T-2] to match targets [1..T-1]
+                pred_pose_seq = pred_poses[:, : T - 1, :]
+                tgt_pose_seq = poses[:, 1:, :]
+
+                # Rewards are (B, T). Use the same alignment.
+                pred_rew_seq = pred_rewards[:, : T - 1]
+                tgt_rew_seq = rewards[:, 1:]
+
+                loss = self.model.compute_loss(
+                    pred_pose_seq,
+                    pred_rew_seq,
+                    target_pose=tgt_pose_seq,
+                    target_reward=tgt_rew_seq,
+                )
+                return loss
+
+            raise ValueError(f"Unexpected pred_poses shape: {pred_poses.shape}")
 
 
 class LIBERODataset(torch.utils.data.Dataset):
@@ -125,32 +210,36 @@ class LIBERODataset(torch.utils.data.Dataset):
         with h5py.File(file_path, 'r') as f:
             # for demo in f['data'].keys():
             demo = f['data'][demo_key]
-            image = torch.from_numpy(f['data'][demo_key]['obs']['agentview_rgb'][()])
+            image = torch.from_numpy(
+                f['data'][demo_key]['obs']['agentview_rgb'][()])
             action = torch.from_numpy(f['data'][demo_key]['actions'][()])
             dones = torch.from_numpy(f['data'][demo_key]['dones'][()])
             rewards = torch.from_numpy(f['data'][demo_key]['rewards'][()])
             # poses = torch.from_numpy(f['data'][demo_key]['robot_states'][()])
-            poses = torch.from_numpy(np.concatenate( (f['data'][demo_key]['obs']["ee_pos"], 
-                                        f['data'][demo_key]['obs']["ee_ori"][:,:3],
-                                        (f['data'][demo_key]['obs']["gripper_states"][:,:1])), axis=-1))
+            poses = torch.from_numpy(np.concatenate((f['data'][demo_key]['obs']["ee_pos"],
+                                                     f['data'][demo_key]['obs']["ee_ori"][:, :3],
+                                                     (f['data'][demo_key]['obs']["gripper_states"][:, :1])), axis=-1))
             # Note: Images are returned in channel-last format (T, H, W, C)
             # Conversion to channel-first (T, C, H, W) happens in the training loop
-        return image, action, rewards, dones, poses  # Return the image and label if needed
+        # Return the image and label if needed
+        return image, action, rewards, dones, poses
 
 
 class CircularBufferDataset(torch.utils.data.Dataset):
     """Circular buffer dataset that holds up to max_trajectories.
     When full, oldest trajectories are overwritten.
     """
+
     def __init__(self, cfg=None, data_dir=None):
         self.trajectories = []
         self.write_idx = 0
-        self._cfg=cfg
+        self._cfg = cfg
 
         if data_dir is None:
             data_dir = getattr(cfg, 'data_dir', None)
             if data_dir is None and cfg is not None:
-                data_dir = getattr(getattr(cfg, 'dataset', None), 'data_dir', None)
+                data_dir = getattr(
+                    getattr(cfg, 'dataset', None), 'data_dir', None)
             if data_dir is None:
                 data_dir = '/network/projects/real-g-grp/libero/targets_clean/'
 
@@ -161,13 +250,15 @@ class CircularBufferDataset(torch.utils.data.Dataset):
                 cfg=cfg
             )
         else:
-            data_dir = getattr(cfg.dataset, 'data_dir', '/network/projects/real-g-grp/libero/targets_clean/')
+            data_dir = getattr(
+                cfg.dataset, 'data_dir', '/network/projects/real-g-grp/libero/targets_clean/')
             dataset = LIBERODataset(data_dir, transform=transforms.ToTensor())
         num_to_load = min(len(dataset), self._cfg.dataset.buffer_size)
         if num_to_load == 0:
             return
 
-        indices = np.random.choice(len(dataset), size=num_to_load, replace=False)
+        indices = np.random.choice(
+            len(dataset), size=num_to_load, replace=False)
         for idx in range(num_to_load):
             images, actions, rewards, dones, poses = dataset[idx]
 
@@ -181,7 +272,7 @@ class CircularBufferDataset(torch.utils.data.Dataset):
                 np.array(dones),
                 np.array(poses)
             )
-        
+
     def add_trajectory(self, images, actions, rewards, dones, poses):
         """Add a trajectory to the buffer. Overwrites oldest if full."""
         trajectory = {
@@ -191,25 +282,24 @@ class CircularBufferDataset(torch.utils.data.Dataset):
             'dones': torch.from_numpy(dones),
             'poses': torch.from_numpy(poses)
         }
-        
+
         if len(self.trajectories) < self._cfg.dataset.buffer_size:
             self.trajectories.append(trajectory)
         else:
             # Overwrite oldest trajectory
             self.trajectories[self.write_idx] = trajectory
-            self.write_idx = (self.write_idx + 1) % self._cfg.dataset.buffer_size
-    
+            self.write_idx = (
+                self.write_idx + 1) % self._cfg.dataset.buffer_size
+
     def __len__(self):
         return len(self.trajectories)
-    
+
     def __getitem__(self, idx):
         traj = self.trajectories[idx]
         return traj['images'], traj['actions'], traj['rewards'], traj['dones'], traj['poses']
 
-from datasets import load_dataset
-import datasets
-class LIBERODatasetLeRobot(torch.utils.data.Dataset):
 
+class LIBERODatasetLeRobot(torch.utils.data.Dataset):
 
     """A dataset class for loading LIBERO data from the LeRobot repository."""
 
@@ -217,8 +307,8 @@ class LIBERODatasetLeRobot(torch.utils.data.Dataset):
         # super().__init__(repo_id, transform)
         self.repo_id = repo_id
         self.transform = transform
-        self._dataset = datasets.load_dataset(repo_id, split='train[:{}]'.format(cfg.dataset.buffer_size), keep_in_memory=True)
-
+        self._dataset = datasets.load_dataset(repo_id, split='train[:{}]'.format(
+            cfg.dataset.buffer_size), keep_in_memory=True)
 
     def __len__(self):
         return len(self._dataset)
@@ -226,21 +316,24 @@ class LIBERODatasetLeRobot(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         # Load trajectory data from LeRobot dataset
         sample = self._dataset[idx]
-        
+
         # Extract trajectory components
         images = torch.from_numpy(np.array(sample['img'])).float()
         actions = torch.from_numpy(np.array(sample['action'])).float()
-        rewards = torch.from_numpy(np.array(sample['rewards'])).float() if 'rewards' in sample else torch.zeros(len(actions))
-        dones = torch.from_numpy(np.array(sample['terminated'])).float() if 'terminated' in sample else torch.zeros(len(actions))
-        poses = torch.from_numpy(np.array(sample['poses'])).float() if 'poses' in sample else torch.zeros(len(actions), 7)
-        
+        rewards = torch.from_numpy(np.array(sample['rewards'])).float(
+        ) if 'rewards' in sample else torch.zeros(len(actions))
+        dones = torch.from_numpy(np.array(sample['terminated'])).float(
+        ) if 'terminated' in sample else torch.zeros(len(actions))
+        poses = torch.from_numpy(np.array(sample['poses'])).float(
+        ) if 'poses' in sample else torch.zeros(len(actions), 7)
+
         # Note: Images are returned in channel-last format (T, H, W, C)
         # Conversion to channel-first (T, C, H, W) happens in the training loop
-        
+
         return images, actions, rewards, dones, poses
 
 
-@hydra.main(config_path="./conf", config_name="64pix-pose")
+@hydra.main(version_base=None, config_path="./conf", config_name="64pix-pose")
 def my_main(cfg: DictConfig):
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -251,7 +344,7 @@ def my_main(cfg: DictConfig):
         wandb.init(
             project=cfg.experiment.project,
             # track hyperparameters and run metadata
-            config= OmegaConf.to_container(cfg),
+            config=OmegaConf.to_container(cfg),
             name=cfg.experiment.name,
         )
         wandb.run.log_code(".")
@@ -262,11 +355,12 @@ def my_main(cfg: DictConfig):
 
     # Initialize the model using factory
     img_shape = [3, 64, 64]
-    model = create_model(model_type, img_shape, action_dim=7, device=device, cfg=cfg)
-    
+    model = create_model(model_type, img_shape,
+                         action_dim=7, device=device, cfg=cfg)
+
     # Wrap model for unified training interface
     model_wrapper = ModelTrainingWrapper(model, model_type, device)
-    
+
     # Initialize planner (works with both model types through the model interface)
     if cfg.use_policy:
         print("[info] Using policy-based planner (CEMPlanner with policy)")
@@ -277,18 +371,19 @@ def my_main(cfg: DictConfig):
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(256, 14)  # Output 14: 7 for mean, 7 for log_std
+            nn.Linear(256, 14),  # Output 14: 7 for mean, 7 for log_std
+            # nn.Tanh()  # Ensure mean actions are in [-1, 1] range; log_std can be any real number
         )
         policy.to(device)
         planner = PolicyPlanner(
-            model, 
+            model,
             policy_model=policy,
             action_dim=7,
             cfg=cfg
         )
     else:
         planner = CEMPlanner(
-            model, 
+            model,
             action_dim=7,
             cfg=cfg
         )
@@ -307,17 +402,18 @@ def my_main(cfg: DictConfig):
                 cfg=cfg
             )
         else:
-            data_dir = getattr(cfg.dataset, 'data_dir', '/network/projects/real-g-grp/libero/targets_clean/')
+            data_dir = getattr(
+                cfg.dataset, 'data_dir', '/network/projects/real-g-grp/libero/targets_clean/')
             dataset = LIBERODataset(data_dir, transform=transforms.ToTensor())
 
     batch_size = 32
     cfg.policy.sequence_length = 16
     # Define optimizer and loss function
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    
+
     # Add linear learning rate scheduler that decays to 0 over training
     scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer, 
+        optimizer,
         start_factor=1.0,  # Start at full learning rate
         end_factor=0.01,    # End at 0 learning rate
         total_iters=cfg.max_iters     # Decay over num_epochs
@@ -326,45 +422,105 @@ def my_main(cfg: DictConfig):
 
     # Training loop
     for epoch in range(cfg.max_iters):
-        
         num_idx = np.arange(len(dataset))
         np.random.shuffle(num_idx)
         loss = 0.0
+        policy_loss = 0.0
         batch_counter = 0
-        
+        # Accumulate all encoded poses and actions for policy training at the end of the epoch
+        all_enc_poses_epoch = []
+        all_enc_actions_epoch = []
+        if epoch == 0 or ((epoch-1) % cfg.eval_vid_iters == 0 and cfg.planner.type != 'policy'):
+            # print(f"[info] Starting epoch {epoch+1}/{cfg.max_iters} with {len(dataset)} trajectories in dataset")
+            # Batch data using the batch_data utility function
+            dataloader = batch_data(dataset, batch_size=batch_size, cfg=cfg)
+
         # Process data in batches
-        for batch_start in range(0, len(num_idx), batch_size):
-            batch_end = min(batch_start + batch_size, len(num_idx))
-            batch_indices = num_idx[batch_start:batch_end]
-            # Collect sequences for the batch
-            # [TODO]
-            # TODO:    
-            ## Implement data loading and training step for the batch
+        for batch in dataloader:
+            images, actions, rewards, dones, poses = batch
+            # Normalize poses and actions for SimpleWorldModel
+            if model_type == 'simple':
+                enc_pose_seq = model.encode_pose(poses)
+                enc_action_seq = model.encode_action(actions)
+
+            if cfg.use_policy and cfg.planner.type == 'policy':
+                policy.train()  # Set policy to training mode
+                policy_loss = planner.update(enc_pose_seq, enc_action_seq)
+            elif cfg.planner.type == 'policy_guided_cem':
+                # Load pretrained policy model
+                planner.load_policy_model(cfg.load_policy)
+
+            # Training world model on the batch
+            model.train()  # Set model to training mode
+            ## Call model_wrapper.forward_pass() with appropriate inputs based on model type
+            pred_pose_seq, pred_reward_seq = model_wrapper.forward_pass(images if model_type == 'dreamer' else None,
+                                                     enc_pose_seq if model_type == 'simple' else None,
+                                                     enc_action_seq if model_type == 'simple' else None)
+            batch_loss = model_wrapper.compute_loss(pred_pose_seq,
+                                                    pred_reward_seq,
+                                                   images if model_type == 'dreamer' else None,
+                                                   rewards,
+                                                   dones,
+                                                   enc_pose_seq if model_type == 'simple' else None,
+                                                   enc_action_seq if model_type == 'simple' else None)
+            optimizer.zero_grad()
+            batch_loss.backward()
+            # Clip gradients to prevent large updates from destabilising training
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            loss = batch_loss.item()
+            batch_counter += 1
+            # Implement data loading and training step for the batch
             print(f'Epoch [{epoch+1}/{cfg.max_iters }], Batch [{batch_counter}/{(len(dataset) + batch_size - 1) // batch_size}], Loss: {batch_loss.item():.4f}, policy_loss: {policy_loss:.4f}')
+        
+        # Train the policy ONCE per epoch on all accumulated (pose, action) pairs
+        if cfg.use_policy and cfg.planner.type == 'policy':
+            if wandb is not None:
+                wandb.log({"policy_loss": policy_loss})
+
+        # Log training loss to wandb
+        if wandb is not None:
+            wandb.log({"train_loss": loss})
 
         # save the model checkpoint
         if epoch % cfg.eval_vid_iters == 0:
-            torch.save(model.state_dict(), f'model_epoch_{epoch+1}_batch_{batch_counter}.pth', pickle_module=dill)
-                # Evaluate the model using eval_libero from sim_eval
+            os.makedirs("checkpoints", exist_ok=True)
+            subcheckpoint_dir = os.path.join("checkpoints", f"{cfg.experiment.name}")
+            os.makedirs(subcheckpoint_dir, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(subcheckpoint_dir, f'model_epoch_{epoch+1}_batch_{batch_counter}.pth'), pickle_module=dill)
+            # Save policy model if using policy-based planner
+            if cfg.use_policy and cfg.planner.type=='policy':
+                torch.save(planner.policy_model.state_dict(), os.path.join(subcheckpoint_dir, f'policy.pth'), pickle_module=dill)
+            # Evaluate the model using eval_libero from sim_eval
             print("[info] Starting evaluation on LIBERO tasks...")
-            data = eval_libero(planner, device, cfg, iter_=epoch, log_dir="./", 
+            data = eval_libero(planner, device, cfg, iter_=epoch, log_dir="./",
                                wandb=wandb)
-            if cfg.use_random_data:
+            if cfg.use_random_data and cfg.planner.type != 'policy':
                 # Add new random trajectories to the buffer
                 for traj in data['traj']:
+                    # Check for NaNs in poses and actions
+                    if np.isnan(traj['poses']).any():
+                        print("Warning: NaNs detected in trajectory poses. Check data collection.")
+                        print(f"NaN count in poses: {np.isnan(traj['poses']).sum()} out of {traj['poses'].size}")
+                    if np.isnan(traj['actions']).any():
+                        print("Warning: NaNs detected in trajectory actions. Check data collection.")
+                        print(f"NaN count in actions: {np.isnan(traj['actions']).sum()} out of {traj['actions'].size}")
                     dones = np.zeros_like(traj['rewards'])
                     dones[-1] = 1
-                    ## observations need to be changed to channel first
-                    observations = np.array(traj['observations'])  # (T, 1, H, W, C) -> (T, H, W, C)
-                    observations = np.transpose(observations, (0, 3, 1, 2))  # (T, H, W, C) -> (T, C, H, W)
+                    # observations need to be changed to channel first
+                    # (T, 1, H, W, C) -> (T, H, W, C)
+                    observations = np.array(traj['observations'])
+                    # (T, H, W, C) -> (T, C, H, W)
+                    # observations = np.transpose(observations, (0, 3, 1, 2))
                     dataset.add_trajectory(observations, np.array(traj['actions']),
                                            np.array(traj['rewards']), np.array(dones), np.array(traj['poses']))
-                print(f"[info] Added new random trajectories to buffer. Current buffer size: {len(dataset)}")
-        
+                print(
+                    f"[info] Added new random trajectories to buffer. Current buffer size: {len(dataset)}")
+
         # Step the learning rate scheduler after each epoch
         scheduler.step()
-        print(f'Learning rate after epoch {epoch+1}: {scheduler.get_last_lr()[0]:.6f}')
-
+        print(
+            f'Learning rate after epoch {epoch+1}: {scheduler.get_last_lr()[0]:.6f}')
 
 
 if __name__ == '__main__':

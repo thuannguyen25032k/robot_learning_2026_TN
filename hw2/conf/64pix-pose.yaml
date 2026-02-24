@@ -1,5 +1,6 @@
 defaults:
   - dataset: libero
+  - _self_
 
 # Model selection: 'dreamer' or 'simple'
 model_type: 'simple'
@@ -14,24 +15,25 @@ loss_coeffs:
 
 # CEM Planner parameters
 planner:
+  type: cem  # Default planner type
   horizon: 12
   num_iterations: 3
-  num_samples: 100policy = nn.Sequential(
-            nn.Linear(7, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 7)
-        )
-        policy.to(device)
+  num_samples: 100
   num_elites: 20
   temperature: 0.1
   learning_rate: 0.001
 
 experiment:
-  name: mini_grp
-  project: mini-grp
+  name: hw2
+  project: Homework 2 - Dreamer and CEM Planner
   description: "simple env with 64pix images and pose data"
+
+# Training parameters
+training:
+  num_epochs: 100  # Default number of training epochs
+
+# Experiment name (can be overridden)
+exp_name: "default_exp"
 
 # Model type: "transformer" or "convnet" or "dataset" or "dense"
 model: 
@@ -63,14 +65,14 @@ testing: false
 eval_vid_iters: 50
 gradient_accumulation_steps: 1
 
-simEval: ["libero"] # "simpler_env" or "libero"
+simEval: ["libero"]
 sim:
   eval_episodes: 1
-  eval_tasks: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # which tasks to eval on
-  episode_length: 100
+  eval_tasks: [0,0,0]
+  episode_length: 500
   task_set: "libero_spatial"
-  libero_init_state_file: "/openvla/experiments/robot/libero/libero_spatial_init_states_and_goals.hdf" # Path to HDF5 file containing initial states for LIBERO tasks.
-  libero_init_state_hf_repo: "gberseth/libero_spatial_init_states" # Dataset key within the HDF5 file for LIBERO initial states.
+  libero_init_state_file: "/openvla/experiments/robot/libero/libero_spatial_init_states_and_goals.hdf"
+  libero_init_state_hf_repo: "gberseth/libero_spatial_init_states"
 
 # ------------
 

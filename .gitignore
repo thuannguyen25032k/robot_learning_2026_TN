@@ -1,0 +1,23 @@
+# --- Large third-party / vendored code ---
+LIBERO/
+
+# --- Homework 2 generated artifacts ---
+hw2/checkpoints/
+hw2/logs/
+hw2/outputs/
+hw2/videos/
+hw2/wandb/
+
+# --- Common Python ignores (nice-to-have) ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.dist-info/
+.venv/
+venv/
+.env/
+.ipynb_checkpoints/
+.DS_Store

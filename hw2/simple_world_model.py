@@ -20,7 +20,22 @@ class SimpleWorldModel(GRPBase):
                  cfg=None):
         # TODO: Part 1.1 - Initialize SimpleWorldModel architecture
         ## Define the feature network and output heads (pose and reward)
-        pass
+        super(SimpleWorldModel, self).__init__(cfg)
+        input_dim = pose_dim + action_dim
+        self.feature_net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        # Output heads for next pose and reward (1st idea)
+        self.pose_head = nn.Linear(hidden_dim, pose_dim)
+        self.reward_head = nn.Linear(hidden_dim, 1)
+        self.type = 'simple'
+        self.device = self._cfg.device
+        self.to(self.device)
     
     def forward(self, pose, action):
         """
@@ -36,25 +51,43 @@ class SimpleWorldModel(GRPBase):
         """
         # TODO: Part 1.1 - Implement forward pass
         ## Concatenate pose and action, pass through feature network and output heads
-        pass
+        # Handle both (B, D) and (B, T, D) shapes
+        if pose.dim() == 2:  # (B, D)
+            x = torch.cat([pose, action], dim=-1)  # (B, pose_dim + action_dim)
+            features = self.feature_net(x)  # (B, hidden_dim)
+            next_pose_pred = self.pose_head(features)  # (B, pose_dim)
+            reward_pred = self.reward_head(features)  # (B, 1)
+        else:  # (B, T, D)
+            B, T, _ = pose.shape
+            # (B, T, pose_dim + action_dim)
+            x = torch.cat([pose, action], dim=-1)
+            x = x.view(B * T, -1)  # (B*T, pose_dim + action_dim)
+            features = self.feature_net(x)  # (B*T, hidden_dim)
+            next_pose_pred = self.pose_head(features).view(
+                B, T, -1)  # (B, T, pose_dim)
+            reward_pred = self.reward_head(features).view(
+                B, T)  # (B, T, 1) -> (B, T)
+        return next_pose_pred, reward_pred
     
     def predict_next_pose(self, pose, action):
         """
-        Convenience method to predict next pose and reward, decoding pose to original space.
-        
+        Predict the next pose and reward given current pose and action.
+
         Args:
-            pose: Normalized pose (7-d vector or batch)
-            action: Action in original space (will be encoded)
-        
+            pose: Current pose tensor (B, pose_dim) or (B, T, pose_dim), normalized
+            action: Action tensor (B, action_dim) or (B, T, action_dim), normalized
         Returns:
-            next_pose: Pose in original space
-            reward: Predicted reward
+            next_pose_pred: Predicted next pose in normalized space (B, pose_dim) or (B, T, pose_dim)
+            reward_pred: Predicted reward (B, 1) or (B, T, 1)
         """
         # TODO: Part 1.1 - Implement prediction method
         ## Encode action, call forward, and decode pose to original space
-        pass
+        # I assume both pose and action are already normalized
+        next_pose_pred, reward_pred = self.forward(pose, action) # (B, pose_dim), (B, 1) or (B, T, pose_dim), (B, T)
+        # I also assume that the next_pose_pred will be decoded to original space later.
+        return next_pose_pred, reward_pred
     
-    def compute_loss(self, pose, action, target_pose, target_reward=None):
+    def compute_loss(self, pred_pose, pred_reward, target_pose, target_reward=None):
         """
         Compute MSE loss between predicted and target pose and reward.
         
@@ -69,4 +102,12 @@ class SimpleWorldModel(GRPBase):
         """
         # TODO: Part 1.2 - Implement SimpleWorldModel loss computation
         ## Compute MSE loss for pose and reward predictions
-        pass
+        pose_loss = nn.MSELoss()(pred_pose, target_pose)
+        if target_reward is not None:
+            reward_loss = nn.MSELoss()(pred_reward, target_reward)
+            total_loss = pose_loss + reward_loss
+        else:
+            total_loss = pose_loss
+        # Add optional weighting if desired (e.g., total_loss = pose_loss + reward_loss * reward_weight)
+        # Add any regularization losses if needed (e.g., L2 on weights)
+        return total_loss

@@ -17,6 +17,14 @@ class GRPBase(nn.Module):
     def __init__(self, cfg):
         super(GRPBase, self).__init__()
         self._cfg = cfg
+        self._action_mean = torch.tensor(self._cfg.dataset.action_mean, dtype=torch.float32, device=self._cfg.device)
+        self._action_std = torch.tensor(self._cfg.dataset.action_std, dtype=torch.float32, device=self._cfg.device)
+        self._stacking_action_mean = torch.tensor(np.repeat([self._cfg.dataset.action_mean], self._cfg.policy.action_stacking, axis=0).flatten(), 
+                                                 dtype=torch.float32, device=self._cfg.device)
+        self._stacking_action_std = torch.tensor(np.repeat([self._cfg.dataset.action_std], self._cfg.policy.action_stacking, axis=0).flatten(), 
+                                                dtype=torch.float32, device=self._cfg.device)
+        self._pose_mean = torch.tensor(self._cfg.dataset.pose_mean, dtype=torch.float32, device=self._cfg.device)
+        self._pose_std = torch.tensor(self._cfg.dataset.pose_std, dtype=torch.float32, device=self._cfg.device)
 
     def encode_text_goal(self, goal, tokenizer=None, text_model=None):
         import numpy as _np
@@ -79,10 +87,8 @@ class GRPBase(nn.Module):
     def decode_action(self, action_tensor):
         """Decode normalized actions to original action space"""
         import torch as _torch
-        action_mean = _torch.tensor(np.repeat([self._cfg.dataset.action_mean], self._cfg.policy.action_stacking, axis=0).flatten(), 
-                                   dtype=action_tensor.dtype, device=action_tensor.device)
-        action_std = _torch.tensor(np.repeat([self._cfg.dataset.action_std], self._cfg.policy.action_stacking, axis=0).flatten(), 
-                                  dtype=action_tensor.dtype, device=action_tensor.device)
+        action_mean = self._stacking_action_mean
+        action_std = self._stacking_action_std
         return (action_tensor * (action_std)) + action_mean
 
     def encode_action(self, action_float):
@@ -90,14 +96,12 @@ class GRPBase(nn.Module):
         import torch as _torch
         ## If the action_float has length greater than action_dim then use stacking otherwise just use normal standardiaztion vectors
         if action_float.shape[1] == len(self._cfg.dataset.action_mean):
-            action_mean = _torch.tensor(self._cfg.dataset.action_mean, dtype=action_float.dtype, device=action_float.device)
-            action_std = _torch.tensor(self._cfg.dataset.action_std, dtype=action_float.dtype, device=action_float.device)
+            action_mean = self._action_mean
+            action_std = self._action_std
             return (action_float - action_mean) / (action_std)  
 
-        action_mean = _torch.tensor(np.repeat([self._cfg.dataset.action_mean], self._cfg.policy.action_stacking, axis=0).flatten(), 
-                                   dtype=action_float.dtype, device=action_float.device)
-        action_std = _torch.tensor(np.repeat([self._cfg.dataset.action_std], self._cfg.policy.action_stacking, axis=0).flatten(), 
-                                  dtype=action_float.dtype, device=action_float.device)
+        action_mean = self._stacking_action_mean
+        action_std = self._stacking_action_std
         return (action_float - action_mean) / (action_std)
     
     def decode_pose(self, pose_tensor):
@@ -109,8 +113,8 @@ class GRPBase(nn.Module):
         self._decode_state = lambda sinN: (sinN * state_std) + state_mean  # Undo mapping to [-1, 1]
         """
         import torch as _torch
-        pose_mean = _torch.tensor(self._cfg.dataset.pose_mean, dtype=pose_tensor.dtype, device=pose_tensor.device)
-        pose_std = _torch.tensor(self._cfg.dataset.pose_std, dtype=pose_tensor.dtype, device=pose_tensor.device)
+        pose_mean = self._pose_mean
+        pose_std = self._pose_std
         return (pose_tensor * (pose_std)) + pose_mean
     
     def encode_pose(self, pose_float):
@@ -122,8 +126,8 @@ class GRPBase(nn.Module):
         self._encode_pose = lambda pf:   (pf - pose_mean)/(pose_std) # encoder: take a float, output an integer
         """
         import torch as _torch
-        pose_mean = _torch.tensor(self._cfg.dataset.pose_mean, dtype=pose_float.dtype, device=pose_float.device)
-        pose_std = _torch.tensor(self._cfg.dataset.pose_std, dtype=pose_float.dtype, device=pose_float.device)
+        pose_mean = self._pose_mean
+        pose_std = self._pose_std
         return (pose_float - pose_mean) / (pose_std)
 
 class DreamerV3(GRPBase):

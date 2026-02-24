@@ -67,21 +67,36 @@ def eval_model_in_sim(cfg, model, device, log_dir, env, env_unwrapped,
             image = np.stack(obs_hist, axis=-1)  # stack along the last dimension
             image = rearrange(image, 'h w c t -> h w (c t)')  # add batch dimension
 
-            obs_state = torch.tensor(model.preprocess_state(image), dtype=torch.float32)
-            goal_state = torch.tensor(model.preprocess_goal_image(image[:,:,:3]), dtype=torch.float32)
-            
+            # Prepare observations and goal arrays (keep them as numpy until conversion)
+            obs_state_np = np.array(model.preprocess_state(image), dtype=np.float32)
+            goal_state_np = np.array(model.preprocess_goal_image(image[:,:,:3]), dtype=np.float32)
+
             # Prepare last_action tensor if available
             last_action_tensor = None
             if last_action is not None:
-                last_action_tensor = torch.tensor(last_action[:cfg.action_dim], dtype=torch.float32).unsqueeze(0).to(device)
-            
-            action, loss = model.forward(torch.tensor(obs_state.unsqueeze(0), dtype=torch.float32).to(device)
-                                ,torch.tensor(txt_goal).to(device)
-                                ,torch.tensor(goal_state.unsqueeze(0), dtype=torch.float32).to(device),
-                                mask_=True, ## Masks goal image
-                                pose=torch.tensor([[obs["extra"]["tcp_pose"]]], dtype=torch.float32).to(device),
-                                last_action=last_action_tensor,
-                                )
+                last_action_tensor = torch.from_numpy(np.array(last_action[:cfg.action_dim], dtype=np.float32)).unsqueeze(0).to(device)
+
+            # Prepare text goal tensor (handle both numpy and torch input without copying unnecessarily)
+            if isinstance(txt_goal, torch.Tensor):
+                txt_goal_tensor = txt_goal.clone().detach().to(device)
+            else:
+                txt_goal_tensor = torch.from_numpy(np.array(txt_goal)).float().to(device)
+
+            obs_tensor = torch.from_numpy(obs_state_np).unsqueeze(0).float().to(device)
+            goal_tensor = torch.from_numpy(goal_state_np).unsqueeze(0).float().to(device)
+
+            # Build pose tensor efficiently
+            pose_np = np.array(obs["extra"]["tcp_pose"], dtype=np.float32)
+            pose_tensor = torch.from_numpy(pose_np).unsqueeze(0).unsqueeze(0).to(device)
+
+            action, loss = model.forward(
+                obs_tensor,
+                txt_goal_tensor,
+                goal_tensor,
+                mask_=True,  # Masks goal image
+                pose=pose_tensor,
+                last_action=last_action_tensor,
+            )
 
             action = model.decode_action(action[0]).cpu().detach().numpy() ## Add in the gripper close action
             last_action = action.copy()  # Store for next iteration
@@ -193,6 +208,8 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
     elif hasattr(cfg.sim, 'libero_init_state_file') and cfg.sim.libero_init_state_file:
         print(f"Loading initial states from HDF5: {cfg.sim.libero_init_state_file}")
         init_states_dataset = h5py.File(hydra.utils.get_original_cwd()+cfg.sim.libero_init_state_file, 'r')
+    else:
+        print("No initial states dataset provided, using default initial states from task suite")    
 
     trajectory_data = []
     # retrieve a specific task
@@ -283,34 +300,49 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
                 # obs = obs.reshape((128, 128, 3*cfg.policy.obs_stacking)) ## Assuming the observation is an image of size 128x128 with 3 color channels  
                 obs = rearrange(obs, 't h w c -> h w (t c)', c=3, t=cfg.policy.obs_stacking) ## Rearranging the image to have the stacked history in the last channel dimension
                 # image = obs[:,:,:3] ## Remove the last dimension of the image color
-                obs_state = model.preprocess_state(obs)
-                goal_state = model.preprocess_goal_image(image_goal)
+                obs_state = model.preprocess_state(obs)     # Skip preprocessing for SimpleWorldModel
+                goal_state = model.preprocess_goal_image(image_goal)    # Preprocessing the goal image for both SimpleWorldModel and DreamerWorldModel
+                # Build pose as a single numpy array first (avoids slow tensor-from-list warning)
                 pose_ = model.encode_pose(torch.tensor([[np.concatenate( 
                                         (info["robot0_eef_pos"], 
                                         info["robot0_eef_quat"][:3],
                                         [(info["robot0_gripper_qpos"][0])]), axis=-1)]], 
-                                    dtype=torch.float32)).to(device)
+                                    dtype=torch.float32, device=device))
  
                 # Prepare last_action tensor if available  
                 last_action_tensor = None
                 if last_action is not None:
-                    last_action_tensor = model.encode_action(torch.tensor([[last_action[:cfg.action_dim]]], dtype=torch.float32)).to(device)
-                
+                    last_action_np = np.array(last_action[:cfg.action_dim], dtype=np.float32)
+                    last_action_tensor = model.encode_action(torch.from_numpy(last_action_np).unsqueeze(0).unsqueeze(0).to(device))
+
+                # Prepare tensors efficiently and avoid copying tensors unnecessarily
+                if isinstance(txt_goal, torch.Tensor):
+                    text_goal_tensor = txt_goal.clone().detach().to(device)
+                else:
+                    text_goal_tensor = torch.from_numpy(np.array(txt_goal)).float().to(device)
+
+                observations_tensor = torch.from_numpy(np.array([[obs_state]], dtype=np.float32)).to(device)
+                goal_image_tensor = torch.from_numpy(np.array([goal_state], dtype=np.float32)).to(device)
+
+                # print(f"Step {t}, obs_state shape: {observations_tensor.shape}, text_goal shape: {text_goal_tensor.shape}, goal_image shape: {goal_image_tensor.shape}, pose shape: {pose_.shape}, last_action shape: {last_action_tensor.shape if last_action_tensor is not None else None}")
+                # Note that: return_full_sequence=False by default, so we only get the next action, not the whole sequence of future actions
                 out = model.forward(
-                    observations=torch.tensor(np.array([[obs_state]])).to(device),
-                    text_goal=torch.tensor(txt_goal).to(device),
-                    goal_image=torch.tensor(np.array([goal_state])).to(device), 
+                    observations=observations_tensor,
+                    text_goal=text_goal_tensor,
+                    goal_image=goal_image_tensor,
                     mask_=True,
                     pose=pose_,
                     prev_actions=last_action_tensor,
                 )
-
+                # Check for NaNs in the output
+                if torch.isnan(out['actions']).any():
+                    print("Warning: NaNs detected in model output actions. Check model architecture and inputs.")
+                    print(f"NaN count in actions: {torch.isnan(out['actions']).sum().item()} out of {out['actions'].numel()}")
                 action = model.decode_action(out['actions'][0]).cpu().detach().numpy()
                 last_action = action.copy()  # Store for next iteration 
                 ## If the actions are stacked into a longer vector execute the sequence of actions
                 for step_ in range(cfg.policy.action_stacking):
                     act_ = action[cfg.action_dim*step_:(cfg.action_dim*(step_+1))]
-                    ## Resize image for data
                     image = obs  # Resize to 128x128
                     frames.append(image)
                     pose_data = np.concatenate((info["robot0_eef_pos"], info["robot0_eef_quat"][:3], [(info["robot0_gripper_qpos"][0])]), axis=-1)
@@ -331,7 +363,13 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
                 if done:
                     print("Episode finished with success after {} timesteps".format(step_))
                     break
-            
+            # Check for NaNs in poses and actions
+            if np.isnan(np.array(poses_list)).any():
+                print("Warning: NaNs detected in recorded poses. Check environment and model outputs.")
+                print(f"NaN count in poses: {np.isnan(np.array(poses_list)).sum()} out of {np.array(poses_list).size}")
+            if np.isnan(np.array(actions_list)).any():
+                print("Warning: NaNs detected in recorded actions. Check environment and model outputs.")
+                print(f"NaN count in actions: {np.isnan(np.array(actions_list)).sum()} out of {np.array(actions_list).size}")
             trajectory_data.append({
                 'task_id': task_id,
                 'init_state_id': init_state_id,
@@ -342,7 +380,11 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
                 'actions': actions_list,
             })
             import os
-            path_ = os.path.join(log_dir, f"libero-{iter_}-task-id-{task_id}-init-id-{init_state_id}.mp4")
+            video_dir = os.path.join(log_dir, "videos")
+            os.makedirs(video_dir, exist_ok=True)
+            sub_video_dir = os.path.join(video_dir, f"{cfg.experiment.name}")
+            os.makedirs(sub_video_dir, exist_ok=True)
+            path_ = os.path.join(sub_video_dir, f"libero-{iter_}-task-id-{task_id}-init-id-{init_state_id}.mp4")
             import imageio
             imageio.mimsave(path_, frames, fps=20)
     episode_stats = info.get('episode_stats', {})
