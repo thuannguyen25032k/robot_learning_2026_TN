@@ -1,7 +1,10 @@
 import torch
 import torch.nn as nn
 import numpy as np
-from dreamerV3 import GRPBase
+try:
+    from .dreamerV3 import GRPBase
+except ImportError:
+    from dreamerV3 import GRPBase
 
 
 class SimpleWorldModel(GRPBase):

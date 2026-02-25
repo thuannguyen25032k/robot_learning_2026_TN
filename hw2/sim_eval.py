@@ -338,6 +338,10 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
                 if torch.isnan(out['actions']).any():
                     print("Warning: NaNs detected in model output actions. Check model architecture and inputs.")
                     print(f"NaN count in actions: {torch.isnan(out['actions']).sum().item()} out of {out['actions'].numel()}")
+                # Check for zeros in the output which might indicate a problem with the model or the input data
+                if torch.sum(out['actions'] == 0).item() > 0:
+                    print("Warning: Zero values detected in model output actions. Check model architecture and inputs.")
+                    print(f"Zero count in actions: {torch.sum(out['actions'] == 0).item()} out of {out['actions'].numel()}")
                 action = model.decode_action(out['actions'][0]).cpu().detach().numpy()
                 last_action = action.copy()  # Store for next iteration 
                 ## If the actions are stacked into a longer vector execute the sequence of actions

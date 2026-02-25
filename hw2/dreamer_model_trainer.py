@@ -16,13 +16,18 @@ import torch
 from torchvision import transforms
 import h5py
 import numpy as np
-from dreamerV3 import DreamerV3
-from simple_world_model import SimpleWorldModel
-from planning import CEMPlanner, PolicyPlanner, RandomPlanner
-from libero.libero import benchmark, get_libero_path
-from libero.libero.envs import OffScreenRenderEnv
+
+# Support both `python hw2/dreamer_model_trainer.py` (cwd=hw2) and
+# `python -m hw2.dreamer_model_trainer` / importing as a package.
+try:
+    from .dreamerV3 import DreamerV3
+    from .simple_world_model import SimpleWorldModel
+    from .planning import CEMPlanner, PolicyPlanner, RandomPlanner
+except ImportError:
+    from dreamerV3 import DreamerV3
+    from simple_world_model import SimpleWorldModel
+    from planning import CEMPlanner, PolicyPlanner, RandomPlanner
 import random
-from sim_eval import eval_libero
 from collections import deque
 from datasets import load_dataset
 import datasets
@@ -119,12 +124,17 @@ class ModelTrainingWrapper:
             output: Model output (format depends on model type)
         """
         if self.model_type == 'dreamer':
+            # DreamerV3 returns a dict of rollout predictions.
             return self.model(images, actions)
         elif self.model_type == 'simple':
             # SimpleWorldModel expects normalized inputs
-            return self.model(poses, actions)
+            pred_pose_seq, pred_reward_seq = self.model(poses, actions)
+            return {
+                'pred_poses': pred_pose_seq,
+                'pred_rewards': pred_reward_seq
+            }
 
-    def compute_loss(self, pred_poses, pred_rewards, images, rewards, dones, poses, actions):
+    def compute_loss(self, model_out, images, rewards, dones, poses, actions):
         """
         Compute loss in a way that works for both model types.
 
@@ -142,14 +152,19 @@ class ModelTrainingWrapper:
         """
         if self.model_type == 'dreamer':
             # Use DreamerV3 loss computation
-            return self.model.compute_loss(
-                output, images, rewards, dones, self.device
-
-            )
+            if not isinstance(model_out, dict):
+                raise ValueError(
+                    f"DreamerV3 forward must return a dict, got {type(model_out)}"
+                )
+            return self.model.compute_loss(model_out, images, rewards, dones, self.device)
         elif self.model_type == 'simple':
             # TODO: Part 1.2 - Implement SimpleWorldModel training loss
             # Compute MSE loss between predicted and target poses/rewards
             # Ensure rewards are always (B, T)
+            pred_poses = model_out['pred_poses']
+            pred_rewards = model_out['pred_rewards']
+            if pred_rewards is None:
+                raise ValueError("SimpleWorldModel path expected pred_rewards, got None")
             if pred_rewards.dim() == 3 and pred_rewards.shape[-1] == 1:
                 pred_rewards = pred_rewards.squeeze(-1)
             # Check shape of pred_poses and pred_rewards
@@ -365,14 +380,24 @@ def my_main(cfg: DictConfig):
     if cfg.use_policy:
         print("[info] Using policy-based planner (CEMPlanner with policy)")
         import torch.nn as nn
-        # Stochastic policy that outputs both mean and log_std for Gaussian distribution
+
+        # PolicyPlanner expects the policy input to match the planner's state feature:
+        # - SimpleWorldModel: encoded pose (dim=7)
+        # - DreamerV3: concat([h, z]) with dim = deter_dim + stoch_dim * discrete_dim
+        if model_type == 'dreamer':
+            policy_in_dim = int(model.deter_dim + model.stoch_dim * model.discrete_dim)
+        else:
+            policy_in_dim = 7
+
+        # Stochastic policy that outputs both mean and log_std for Gaussian distribution.
+        # Output 2*action_dim = 14: 7 for mean, 7 for log_std.
         policy = nn.Sequential(
-            nn.Linear(7, 256),
+            nn.Linear(policy_in_dim, 256),
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(256, 14),  # Output 14: 7 for mean, 7 for log_std
-            # nn.Tanh()  # Ensure mean actions are in [-1, 1] range; log_std can be any real number
+            nn.Linear(256, 14),
+            nn.Tanh(),
         )
         policy.to(device)
         planner = PolicyPlanner(
@@ -381,6 +406,9 @@ def my_main(cfg: DictConfig):
             action_dim=7,
             cfg=cfg
         )
+        if cfg.planner.type == 'policy_guided_cem':
+            # Load pretrained policy model for policy-guided CEM
+            planner.load_policy_model(cfg.load_policy)
     else:
         planner = CEMPlanner(
             model,
@@ -406,7 +434,7 @@ def my_main(cfg: DictConfig):
                 cfg.dataset, 'data_dir', '/network/projects/real-g-grp/libero/targets_clean/')
             dataset = LIBERODataset(data_dir, transform=transforms.ToTensor())
 
-    batch_size = 32
+    batch_size = 256
     cfg.policy.sequence_length = 16
     # Define optimizer and loss function
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -430,8 +458,8 @@ def my_main(cfg: DictConfig):
         # Accumulate all encoded poses and actions for policy training at the end of the epoch
         all_enc_poses_epoch = []
         all_enc_actions_epoch = []
-        if epoch == 0 or ((epoch-1) % cfg.eval_vid_iters == 0 and cfg.planner.type != 'policy'):
-            # print(f"[info] Starting epoch {epoch+1}/{cfg.max_iters} with {len(dataset)} trajectories in dataset")
+        if epoch == 0 or (epoch % cfg.eval_vid_iters == 0):
+            print(f"[info] Starting epoch {epoch+1}/{cfg.max_iters} with {len(dataset)} trajectories in dataset")
             # Batch data using the batch_data utility function
             dataloader = batch_data(dataset, batch_size=batch_size, cfg=cfg)
 
@@ -443,26 +471,41 @@ def my_main(cfg: DictConfig):
                 enc_pose_seq = model.encode_pose(poses)
                 enc_action_seq = model.encode_action(actions)
 
-            if cfg.use_policy and cfg.planner.type == 'policy':
+            # Only the SimpleWorldModel path currently provides a supervised policy target.
+            # (For Dreamer, PolicyPlanner is used for planning guidance, not BC training here.)
+            if (cfg.use_policy and (cfg.planner.type == 'policy' or cfg.planner.type == 'policy_guided_cem')):  
                 policy.train()  # Set policy to training mode
                 policy_loss = planner.update(enc_pose_seq, enc_action_seq)
-            elif cfg.planner.type == 'policy_guided_cem':
-                # Load pretrained policy model
-                planner.load_policy_model(cfg.load_policy)
 
             # Training world model on the batch
             model.train()  # Set model to training mode
             ## Call model_wrapper.forward_pass() with appropriate inputs based on model type
-            pred_pose_seq, pred_reward_seq = model_wrapper.forward_pass(images if model_type == 'dreamer' else None,
-                                                     enc_pose_seq if model_type == 'simple' else None,
-                                                     enc_action_seq if model_type == 'simple' else None)
-            batch_loss = model_wrapper.compute_loss(pred_pose_seq,
-                                                    pred_reward_seq,
-                                                   images if model_type == 'dreamer' else None,
-                                                   rewards,
-                                                   dones,
-                                                   enc_pose_seq if model_type == 'simple' else None,
-                                                   enc_action_seq if model_type == 'simple' else None)
+            if model_type == 'dreamer':
+                model_out = model_wrapper.forward_pass(images, None, actions)
+                loss_dict = model_wrapper.compute_loss(
+                    model_out,
+                    images,
+                    rewards,
+                    dones,
+                    None,
+                    None,
+                )
+                batch_loss = loss_dict['total_loss']
+            else:
+                model_out = model_wrapper.forward_pass(
+                    None,
+                    enc_pose_seq,
+                    enc_action_seq,
+                )
+                batch_loss = model_wrapper.compute_loss(
+                    model_out,
+                    None,
+                    rewards,
+                    dones,
+                    enc_pose_seq,
+                    enc_action_seq,
+                )
+                loss_dict = None
             optimizer.zero_grad()
             batch_loss.backward()
             # Clip gradients to prevent large updates from destabilising training
@@ -471,19 +514,39 @@ def my_main(cfg: DictConfig):
             loss = batch_loss.item()
             batch_counter += 1
             # Implement data loading and training step for the batch
-            print(f'Epoch [{epoch+1}/{cfg.max_iters }], Batch [{batch_counter}/{(len(dataset) + batch_size - 1) // batch_size}], Loss: {batch_loss.item():.4f}, policy_loss: {policy_loss:.4f}')
-        
-        # Train the policy ONCE per epoch on all accumulated (pose, action) pairs
-        if cfg.use_policy and cfg.planner.type == 'policy':
-            if wandb is not None:
-                wandb.log({"policy_loss": policy_loss})
+            if loss_dict is not None:
+                # Dreamer: log the components for quick debugging.
+                print(
+                    f"Epoch [{epoch+1}/{cfg.max_iters }], Batch [{batch_counter}/{(len(dataset) + batch_size - 1) // batch_size}], "
+                    f"Loss: {batch_loss.item():.4f}, recon: {loss_dict['recon_loss'].item():.4f}, "
+                    f"reward: {loss_dict['reward_loss'].item():.4f}, cont: {loss_dict['continue_loss'].item():.4f}, "
+                    f"dyn: {loss_dict['dyn_loss'].item():.4f}, rep: {loss_dict['rep_loss'].item():.4f}, policy_loss: {policy_loss:.4f}"
+                )
+            else:
+                print(
+                    f"Epoch [{epoch+1}/{cfg.max_iters }], Batch [{batch_counter}/{(len(dataset) + batch_size - 1) // batch_size}], "
+                    f"Loss: {batch_loss.item():.4f}, policy_loss: {policy_loss:.4f}"
+                )
 
         # Log training loss to wandb
         if wandb is not None:
-            wandb.log({"train_loss": loss})
+            log_payload = {"train_loss": loss, "policy_loss": policy_loss}
+            # If the last computed loss was Dreamer-style, add its components.
+            if 'loss_dict' in locals() and isinstance(locals().get('loss_dict', None), dict):
+                ld = locals()['loss_dict']
+                log_payload.update(
+                    {
+                        "loss/recon": float(ld['recon_loss'].detach().cpu()),
+                        "loss/reward": float(ld['reward_loss'].detach().cpu()),
+                        "loss/continue": float(ld['continue_loss'].detach().cpu()),
+                        "loss/dyn": float(ld['dyn_loss'].detach().cpu()),
+                        "loss/rep": float(ld['rep_loss'].detach().cpu()),
+                    }
+                )
+            wandb.log(log_payload)
 
         # save the model checkpoint
-        if epoch % cfg.eval_vid_iters == 0:
+        if (epoch+1) % cfg.eval_vid_iters == 0:
             os.makedirs("checkpoints", exist_ok=True)
             subcheckpoint_dir = os.path.join("checkpoints", f"{cfg.experiment.name}")
             os.makedirs(subcheckpoint_dir, exist_ok=True)
@@ -493,9 +556,14 @@ def my_main(cfg: DictConfig):
                 torch.save(planner.policy_model.state_dict(), os.path.join(subcheckpoint_dir, f'policy.pth'), pickle_module=dill)
             # Evaluate the model using eval_libero from sim_eval
             print("[info] Starting evaluation on LIBERO tasks...")
+            # Import lazily so importing this module doesn't require robosuite/LIBERO deps.
+            try:
+                from .sim_eval import eval_libero
+            except ImportError:
+                from sim_eval import eval_libero
             data = eval_libero(planner, device, cfg, iter_=epoch, log_dir="./",
                                wandb=wandb)
-            if cfg.use_random_data and cfg.planner.type != 'policy':
+            if cfg.use_random_data:
                 # Add new random trajectories to the buffer
                 for traj in data['traj']:
                     # Check for NaNs in poses and actions
