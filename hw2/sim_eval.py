@@ -303,11 +303,16 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
                 obs_state = model.preprocess_state(obs)     # Skip preprocessing for SimpleWorldModel
                 goal_state = model.preprocess_goal_image(image_goal)    # Preprocessing the goal image for both SimpleWorldModel and DreamerWorldModel
                 # Build pose as a single numpy array first (avoids slow tensor-from-list warning)
-                pose_ = model.encode_pose(torch.tensor([[np.concatenate( 
-                                        (info["robot0_eef_pos"], 
-                                        info["robot0_eef_quat"][:3],
-                                        [(info["robot0_gripper_qpos"][0])]), axis=-1)]], 
-                                    dtype=torch.float32, device=device))
+                pose_np = np.concatenate(
+                    (
+                        np.asarray(info["robot0_eef_pos"], dtype=np.float32),
+                        np.asarray(info["robot0_eef_quat"][:3], dtype=np.float32),
+                        np.asarray([info["robot0_gripper_qpos"][0]], dtype=np.float32),
+                    ),
+                    axis=-1,
+                )
+                pose_tensor = torch.from_numpy(pose_np).to(device).view(1, 1, -1)
+                pose_ = model.encode_pose(pose_tensor)  # (1, 1, pose_dim)
  
                 # Prepare last_action tensor if available  
                 last_action_tensor = None
@@ -334,15 +339,8 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
                     pose=pose_,
                     prev_actions=last_action_tensor,
                 )
-                # Check for NaNs in the output
-                if torch.isnan(out['actions']).any():
-                    print("Warning: NaNs detected in model output actions. Check model architecture and inputs.")
-                    print(f"NaN count in actions: {torch.isnan(out['actions']).sum().item()} out of {out['actions'].numel()}")
-                # Check for zeros in the output which might indicate a problem with the model or the input data
-                if torch.sum(out['actions'] == 0).item() > 0:
-                    print("Warning: Zero values detected in model output actions. Check model architecture and inputs.")
-                    print(f"Zero count in actions: {torch.sum(out['actions'] == 0).item()} out of {out['actions'].numel()}")
                 action = model.decode_action(out['actions'][0]).cpu().detach().numpy()
+                # action = out['actions'][0].cpu().detach().numpy()  # Assuming the model's output is already in the correct action space and does not require decoding
                 last_action = action.copy()  # Store for next iteration 
                 ## If the actions are stacked into a longer vector execute the sequence of actions
                 for step_ in range(cfg.policy.action_stacking):
@@ -367,13 +365,6 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
                 if done:
                     print("Episode finished with success after {} timesteps".format(step_))
                     break
-            # Check for NaNs in poses and actions
-            if np.isnan(np.array(poses_list)).any():
-                print("Warning: NaNs detected in recorded poses. Check environment and model outputs.")
-                print(f"NaN count in poses: {np.isnan(np.array(poses_list)).sum()} out of {np.array(poses_list).size}")
-            if np.isnan(np.array(actions_list)).any():
-                print("Warning: NaNs detected in recorded actions. Check environment and model outputs.")
-                print(f"NaN count in actions: {np.isnan(np.array(actions_list)).sum()} out of {np.array(actions_list).size}")
             trajectory_data.append({
                 'task_id': task_id,
                 'init_state_id': init_state_id,
@@ -415,23 +406,35 @@ from omegaconf import DictConfig
 @hydra.main(config_path="./conf", config_name="64pix-pose")
 def my_main(cfg: DictConfig):
     import torch
+    import wandb
+    from omegaconf import DictConfig, OmegaConf
+    if not cfg.testing:
+        import wandb
+        # start a new wandb run to track this script
+        wandb.init(
+            project=cfg.experiment.project,
+            # track hyperparameters and run metadata
+            config=OmegaConf.to_container(cfg),
+            name=cfg.experiment.name,
+        )
+        wandb.run.log_code(".")
     # ------------
     # Train and test splits
     # Loading data
     # create RLDS dataset builder
     log_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
-    cfg.dataset.load_dataset = "skip"
+    print("Logging to:", log_dir)
     # model = GRP(cfg)
     # model_ = torch.load("/home/gberseth/playground/mini_grp/miniGRP.pth")
     model_dir = hydra.utils.get_original_cwd()+"/mini-grp/miniGRP.pth"
+    print("Original working directory:", hydra.utils.get_original_cwd())
     print ("Loading model from:", model_dir)
     if "dataset" == cfg.model.type:
         ## load the dataset
-        from mini_shuffel_buffer import CircularBuffer
-        from mock_grp_model import ReplayModel
-        cfg.dataset.load_dataset = True
+        from dreamer_model_trainer import CircularBufferDataset
+        from replay_model import ReplayModel
         model_ = ReplayModel(cfg)
-        dataset_buffer = CircularBuffer(cfg.dataset.buffer_size, cfg, model=model_)
+        dataset_buffer = CircularBufferDataset(cfg=cfg)
         model_.set_dataset(dataset_buffer)
     else:
         from grp_model import GRP
@@ -447,7 +450,7 @@ def my_main(cfg: DictConfig):
     
     if "libero" in cfg.simEval:
         results = eval_libero(model_.to(cfg.device), device=cfg.device, cfg=cfg,
-                          iter_=0, tokenizer=tokenizer, text_model=text_model, wandb=None,
+                          iter_=0, tokenizer=tokenizer, text_model=text_model, wandb=wandb,
                           log_dir=log_dir)
     if "simple_env" in cfg.simEval:
         import simpler_env
@@ -460,7 +463,7 @@ def my_main(cfg: DictConfig):
         env_unwrapped = env.env.env.env ## Updated gymnasium wrapper adds lots of wrappers.
         results = eval_model_in_sim(cfg, model_.to(cfg.device), device=cfg.device, log_dir=log_dir,
                                 env=env, env_unwrapped=env_unwrapped,
-                                wandb=None, iter_=0, tokenizer=tokenizer, text_model=text_model)
+                                wandb=wandb, iter_=0, tokenizer=tokenizer, text_model=text_model)
         print("results:", results)
 
     # cbuffer.save(cfg.dataset.to_name)

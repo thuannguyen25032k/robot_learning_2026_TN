@@ -20,7 +20,7 @@ planner:
   num_iterations: 3
   num_samples: 100
   num_elites: 20
-  temperature: 0.1
+  temperature: 0.3
   learning_rate: 0.001
 
 experiment:
@@ -37,7 +37,7 @@ exp_name: "default_exp"
 
 # Model type: "transformer" or "convnet" or "dataset" or "dense"
 model: 
-  type: "transformer"
+  type: "dataset"
 
 batch_size: 256 # how many independent sequences will we process in parallel?
 max_block_size: 16 ## Tokens for langauge processing
@@ -68,8 +68,8 @@ gradient_accumulation_steps: 1
 simEval: ["libero"]
 sim:
   eval_episodes: 1
-  eval_tasks: [0,0,0, 0, 0, 0, 0, 0, 0, 0] # List of task indices to evaluate on; length should match eval_episodes
-  episode_length: 500
+  eval_tasks: [0, 0, 0, 0, 0, 0, 0, 0, 0] # List of task indices to evaluate on; length should match eval_episodes
+  episode_length: 300
   task_set: "libero_spatial"
   libero_init_state_file: "/openvla/experiments/robot/libero/libero_spatial_init_states_and_goals.hdf"
   libero_init_state_hf_repo: "gberseth/libero_spatial_init_states"

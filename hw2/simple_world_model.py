@@ -6,6 +6,22 @@ try:
 except ImportError:
     from dreamerV3 import GRPBase
 
+class ResMLPBlock(nn.Module):
+    """MLP-ResNet block: x -> x + f(LN(x))."""
+
+    def __init__(self, dim: int, expansion: int = 4, dropout: float = 0.0):
+        super().__init__()
+        hid = dim * expansion
+        self.norm = nn.LayerNorm(dim)
+        self.net = nn.Sequential(
+            nn.Linear(dim, hid),
+            nn.SiLU(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(hid, dim),
+        )
+
+    def forward(self, x):
+        return x + self.net(self.norm(x))
 
 class SimpleWorldModel(GRPBase):
     """
@@ -25,15 +41,16 @@ class SimpleWorldModel(GRPBase):
         ## Define the feature network and output heads (pose and reward)
         super(SimpleWorldModel, self).__init__(cfg)
         input_dim = pose_dim + action_dim
-        self.feature_net = nn.Sequential(
+        n_blocks = 6  # preferred 6-8 blocks; set to 6 by default
+
+        self.input_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
         )
-        # Output heads for next pose and reward (1st idea)
+        self.res_blocks = nn.Sequential(*[ResMLPBlock(hidden_dim, expansion=4, dropout=cfg.dropout) for _ in range(n_blocks)])
+        self.output_norm = nn.LayerNorm(hidden_dim)
+    # Output heads for next pose and reward
         self.pose_head = nn.Linear(hidden_dim, pose_dim)
         self.reward_head = nn.Linear(hidden_dim, 1)
         self.type = 'simple'
@@ -57,7 +74,7 @@ class SimpleWorldModel(GRPBase):
         # Handle both (B, D) and (B, T, D) shapes
         if pose.dim() == 2:  # (B, D)
             x = torch.cat([pose, action], dim=-1)  # (B, pose_dim + action_dim)
-            features = self.feature_net(x)  # (B, hidden_dim)
+            features = self.output_norm(self.res_blocks(self.input_proj(x)))  # (B, hidden_dim)
             next_pose_pred = self.pose_head(features)  # (B, pose_dim)
             reward_pred = self.reward_head(features)  # (B, 1)
         else:  # (B, T, D)
@@ -65,7 +82,7 @@ class SimpleWorldModel(GRPBase):
             # (B, T, pose_dim + action_dim)
             x = torch.cat([pose, action], dim=-1)
             x = x.view(B * T, -1)  # (B*T, pose_dim + action_dim)
-            features = self.feature_net(x)  # (B*T, hidden_dim)
+            features = self.output_norm(self.res_blocks(self.input_proj(x)))  # (B*T, hidden_dim)
             next_pose_pred = self.pose_head(features).view(
                 B, T, -1)  # (B, T, pose_dim)
             reward_pred = self.reward_head(features).view(

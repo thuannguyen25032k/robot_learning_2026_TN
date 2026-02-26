@@ -134,13 +134,13 @@ class ModelTrainingWrapper:
                 'pred_rewards': pred_reward_seq
             }
 
-    def compute_loss(self, model_out, images, rewards, dones, poses, actions):
+    def compute_loss(self, model_out, normalized_images, rewards, dones, poses, actions):
         """
         Compute loss in a way that works for both model types.
 
         Args:
             output: Output from forward_pass
-            images: Image tensor
+            normalized_images: Image tensor
             rewards: Reward tensor
             dones: Done tensor
             poses: Pose tensor (used for SimpleWorldModel)
@@ -156,7 +156,7 @@ class ModelTrainingWrapper:
                 raise ValueError(
                     f"DreamerV3 forward must return a dict, got {type(model_out)}"
                 )
-            return self.model.compute_loss(model_out, images, rewards, dones, self.device)
+            return self.model.compute_loss(model_out, normalized_images, rewards, dones, self.device)
         elif self.model_type == 'simple':
             # TODO: Part 1.2 - Implement SimpleWorldModel training loss
             # Compute MSE loss between predicted and target poses/rewards
@@ -305,6 +305,20 @@ class CircularBufferDataset(torch.utils.data.Dataset):
             self.trajectories[self.write_idx] = trajectory
             self.write_idx = (
                 self.write_idx + 1) % self._cfg.dataset.buffer_size
+            
+    def get_trajectory(self, idx):
+        trajectory = []
+        traj = self.trajectories[idx]
+        for i in range(len(traj['images'])):
+            step_dict = {
+                'observation': traj['images'][i],
+                'action': traj['actions'][i],
+                'reward': traj['rewards'][i],
+                'done': traj['dones'][i],
+                'pose': traj['poses'][i]
+            }
+            trajectory.append(step_dict)
+        return trajectory
 
     def __len__(self):
         return len(self.trajectories)
@@ -348,6 +362,79 @@ class LIBERODatasetLeRobot(torch.utils.data.Dataset):
         return images, actions, rewards, dones, poses
 
 
+# ---------------------------------------------------------------------------
+# Powerful stochastic policy network
+# ---------------------------------------------------------------------------
+class _ResLayer(torch.nn.Module):
+    """Pre-norm residual MLP block: LayerNorm → Linear(d→2d) → SiLU → Linear(2d→d) + skip."""
+    def __init__(self, dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(dim)
+        self.fc1  = torch.nn.Linear(dim, dim * 4)
+        self.act  = torch.nn.SiLU()
+        self.fc2  = torch.nn.Linear(dim * 4, dim)
+        self.drop = torch.nn.Dropout(dropout)
+
+    def forward(self, x):
+        return x + self.drop(self.fc2(self.act(self.fc1(self.norm(x)))))
+
+
+class PolicyNet(torch.nn.Module):
+    """Expressive Gaussian policy for both SimpleWorldModel and DreamerV3.
+
+    Architecture
+    ────────────
+    input_proj  : Linear(in_dim → hidden_dim) + LayerNorm + SiLU
+    trunk       : N × _ResLayer(hidden_dim)   (pre-norm residual blocks)
+    mean_head   : Linear → SiLU → Linear → Tanh   → action means in [-1, 1]
+    logstd_head : Linear → SiLU → Linear → clamp  → log-std in [-5, 2]
+
+    Forward returns torch.cat([mean, log_std], dim=-1)  shape (B, 2*action_dim)
+    so it is a drop-in replacement for the old nn.Sequential policy.
+    """
+
+    LOG_STD_MIN = -5.0
+    LOG_STD_MAX =  2.0
+
+    def __init__(self, in_dim: int, action_dim: int,
+                 hidden_dim: int = 512, n_layers: int = 4,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.action_dim = action_dim
+
+        # Input projection: lifts any input size into the hidden space
+        self.input_proj = torch.nn.Sequential(
+            torch.nn.Linear(in_dim, hidden_dim),
+            torch.nn.LayerNorm(hidden_dim),
+            torch.nn.SiLU(),
+        )
+
+        # Deep residual trunk
+        self.trunk = torch.nn.Sequential(
+            *[_ResLayer(hidden_dim, dropout=dropout) for _ in range(n_layers)]
+        )
+
+        # Separate heads for mean and log-std → richer uncertainty estimates
+        neck_dim = hidden_dim // 2
+        self.mean_head = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, neck_dim),
+            torch.nn.SiLU(),
+            torch.nn.Linear(neck_dim, action_dim),
+            torch.nn.Tanh(),           # bounded action means in [-1, 1]
+        )
+        self.logstd_head = torch.nn.Sequential(
+            torch.nn.Linear(hidden_dim, neck_dim),
+            torch.nn.SiLU(),
+            torch.nn.Linear(neck_dim, action_dim),
+        )
+
+    def forward(self, x):
+        h = self.trunk(self.input_proj(x))
+        mean    = self.mean_head(h)                                           # (B, A) in [-1,1]
+        log_std = self.logstd_head(h).clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)  # (B, A)
+        return torch.cat([mean, log_std], dim=-1)                             # (B, 2A)
+
+
 @hydra.main(version_base=None, config_path="./conf", config_name="64pix-pose")
 def my_main(cfg: DictConfig):
     # Set device
@@ -389,15 +476,14 @@ def my_main(cfg: DictConfig):
         else:
             policy_in_dim = 7
 
-        # Stochastic policy that outputs both mean and log_std for Gaussian distribution.
-        # Output 2*action_dim = 14: 7 for mean, 7 for log_std.
-        policy = nn.Sequential(
-            nn.Linear(policy_in_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, 14),
-            nn.Tanh(),
+        # Stochastic policy: outputs [mean (Tanh-bounded), log_std] concatenated → shape (B, 14).
+        # _PolicyNet: deep residual MLP with pre-norm blocks and separate mean/log-std heads.
+        policy = PolicyNet(
+            in_dim=policy_in_dim,
+            action_dim=7,
+            hidden_dim=512,
+            n_layers=2,
+            dropout=cfg.dropout,
         )
         policy.to(device)
         planner = PolicyPlanner(
@@ -434,7 +520,7 @@ def my_main(cfg: DictConfig):
                 cfg.dataset, 'data_dir', '/network/projects/real-g-grp/libero/targets_clean/')
             dataset = LIBERODataset(data_dir, transform=transforms.ToTensor())
 
-    batch_size = 256
+    batch_size = 64
     cfg.policy.sequence_length = 16
     # Define optimizer and loss function
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -456,8 +542,6 @@ def my_main(cfg: DictConfig):
         policy_loss = 0.0
         batch_counter = 0
         # Accumulate all encoded poses and actions for policy training at the end of the epoch
-        all_enc_poses_epoch = []
-        all_enc_actions_epoch = []
         if epoch == 0 or (epoch % cfg.eval_vid_iters == 0):
             print(f"[info] Starting epoch {epoch+1}/{cfg.max_iters} with {len(dataset)} trajectories in dataset")
             # Batch data using the batch_data utility function
@@ -467,45 +551,47 @@ def my_main(cfg: DictConfig):
         for batch in dataloader:
             images, actions, rewards, dones, poses = batch
             # Normalize poses and actions for SimpleWorldModel
-            if model_type == 'simple':
-                enc_pose_seq = model.encode_pose(poses)
-                enc_action_seq = model.encode_action(actions)
-
-            # Only the SimpleWorldModel path currently provides a supervised policy target.
-            # (For Dreamer, PolicyPlanner is used for planning guidance, not BC training here.)
-            if (cfg.use_policy and (cfg.planner.type == 'policy' or cfg.planner.type == 'policy_guided_cem')):  
-                policy.train()  # Set policy to training mode
-                policy_loss = planner.update(enc_pose_seq, enc_action_seq)
+            normalized_poses = model.encode_pose(poses)
+            normalized_actions = model.encode_action(actions)
+            normalized_images = ((images.float() / 127.5) - 1.0).to(cfg.device) if model_type == 'dreamer' else None
 
             # Training world model on the batch
             model.train()  # Set model to training mode
             ## Call model_wrapper.forward_pass() with appropriate inputs based on model type
             if model_type == 'dreamer':
-                model_out = model_wrapper.forward_pass(images, None, actions)
+                if (cfg.use_policy and (cfg.planner.type == 'policy' or cfg.planner.type == 'policy_guided_cem')):  
+                    policy.train()  # Set policy to training mode
+                    policy_loss = planner.update(normalized_poses, normalized_actions)
+                model_out = model_wrapper.forward_pass(normalized_images, None, normalized_actions)
                 loss_dict = model_wrapper.compute_loss(
                     model_out,
-                    images,
+                    normalized_images,
                     rewards,
                     dones,
                     None,
                     None,
                 )
                 batch_loss = loss_dict['total_loss']
-            else:
+            elif model_type == 'simple':
+                if (cfg.use_policy and (cfg.planner.type == 'policy' or cfg.planner.type == 'policy_guided_cem')):  
+                    policy.train()  # Set policy to training mode
+                    policy_loss = planner.update(normalized_poses, normalized_actions)
                 model_out = model_wrapper.forward_pass(
                     None,
-                    enc_pose_seq,
-                    enc_action_seq,
+                    normalized_poses,
+                    normalized_actions,
                 )
                 batch_loss = model_wrapper.compute_loss(
                     model_out,
                     None,
                     rewards,
                     dones,
-                    enc_pose_seq,
-                    enc_action_seq,
+                    normalized_poses,
+                    normalized_actions,
                 )
                 loss_dict = None
+            else:
+                raise ValueError(f"Unknown model type: {model_type}")
             optimizer.zero_grad()
             batch_loss.backward()
             # Clip gradients to prevent large updates from destabilising training

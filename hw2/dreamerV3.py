@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import OneHotCategorical, Normal, Bernoulli, Independent, OneHotCategoricalStraightThrough
+from torch.distributions import OneHotCategorical, Normal, Bernoulli, Independent, OneHotCategoricalStraightThrough, kl_divergence
 from torch.distributions.utils import probs_to_logits
 import numpy as np
 try:
@@ -281,56 +281,62 @@ class DreamerV3(GRPBase):
             post_in = torch.cat([h, embed], dim=-1) # (B, deter_dim + hidden_dim): combine deterministic state and observation embedding for posterior computation
             post_logits = self.post_net(post_in)  # (B, stoch_dim, discrete_dim): the posterior distribution over the stochastic state based on the new deterministic state and the current observation embedding
             z, z_probs = self.sample_stochastic(post_logits, training=self.training)    # Sample from the posterior during training, and use argmax during evaluation
+            final_post_logits = probs_to_logits(z_probs)  # Convert back to logits for KL divergence computation in loss
             return {
                 'h': h,
                 'z': z,
                 'z_probs': z_probs,
                 'prior_logits': prior_logits,
-                'post_logits': post_logits,
+                'post_logits': final_post_logits,
             }
 
         # 4) Otherwise, sample from the prior (imagination / rollout)
         z, z_probs = self.sample_stochastic(prior_logits, training=self.training)
+        final_prior_logits = probs_to_logits(z_probs)  # Convert back to logits for KL divergence computation in loss
         return {
             'h': h,
             'z': z,
             'z_probs': z_probs,
-            'prior_logits': prior_logits,
+            'prior_logits': final_prior_logits,
             'post_logits': None,
         }
 
-    def forward(self, observations, prev_actions=None, prev_state=None,
+    def forward(self, normalized_observations, prev_actions=None, prev_state=None,
                 mask_=True, pose=None, last_action=None,
                 text_goal=None, goal_image=None):
         # TODO: Part 3.2 - Implement DreamerV3 forward pass
         ## Encode images, unroll RSSM, and compute reconstructions and heads
-        # observations: (B, T, C, H, W)
+        # normalized_observations: (B, T, C, H, W)
         # prev_actions: (B, T, action_dim)
-        if observations is None:
-            raise ValueError("DreamerV3.forward requires `observations` (B, T, C, H, W)")
+        if normalized_observations is None:
+            raise ValueError("DreamerV3.forward requires `normalized_observations` (B, T, C, H, W)")
         if prev_actions is None:
             raise ValueError("DreamerV3.forward requires `prev_actions` (B, T, action_dim)")
 
-        if observations.dim() != 5:
-            raise ValueError(f"observations must have shape (B, T, C, H, W); got {tuple(observations.shape)}")
+        if normalized_observations.dim() != 5:
+            raise ValueError(f"normalized_observations must have shape (B, T, C, H, W); got {tuple(normalized_observations.shape)}")
         if prev_actions.dim() != 3:
             raise ValueError(f"prev_actions must have shape (B, T, A); got {tuple(prev_actions.shape)}")
 
-        B, T, C, H, W = observations.shape
-        device = observations.device
+        B, T, C, H, W = normalized_observations.shape
+        device = normalized_observations.device
 
         # Initialize RSSM state
         state = prev_state if prev_state is not None else self.get_initial_state(B, device=device)
 
-        # Encode observations frame-wise
-        obs_flat = observations.reshape(B * T, C, H, W) # (B*T, C, H, W)
+        # Encode normalized_observations frame-wise.
+        # Normalization to [-1,1] is expected to have been done by the caller
+        # (e.g. dreamer_model_trainer passes normalized_images).
+        # Do NOT call preprocess_state() here: it operates on numpy arrays via
+        # cv2 and would crash / corrupt a GPU tensor.
+        obs_flat = normalized_observations.reshape(B * T, C, H, W)  # (B*T, C, H, W)
         embed_flat = self.encoder(obs_flat)  # (B*T, hidden_dim)
         embed = embed_flat.view(B, T, -1)    # (B, T, hidden_dim)
 
         hs, zs, z_probs_list = [], [], []   # hs: hidden states, zs: sampled stochastic states, z_probs_list: categorical probabilities for KL computation
         priors_logits, posts_logits = [], []    # priors_logits/posts_logits: for KL divergence losses in compute_loss
         rewards, continues = [], []     # rewards: predicted rewards, continues: predicted continue logits
-        recons = []     # recons: reconstructed images
+        features = []   # features: combined [h,z] for each time step, used for actor/critic heads if needed
 
         for t in range(T):
             a_t = prev_actions[:, t, :]     # (B, action_dim): the action taken at time t
@@ -345,32 +351,37 @@ class DreamerV3(GRPBase):
 
             h_t = step_out['h']     # (B, deter_dim): the new deterministic state
             z_t = step_out['z']     # (B, stoch_dim*discrete_dim): the sampled stochastic state (flattened)
-            feat_t = torch.cat([h_t, z_t], dim=-1)  # (B, deter_dim + stoch_dim*discrete_dim): the combined feature vector for decoding and heads
+            # feat_t = torch.cat([h_t, z_t], dim=-1)  # (B, deter_dim + stoch_dim*discrete_dim): the combined feature vector for decoding and heads
 
             hs.append(h_t) 
             zs.append(z_t)
             z_probs_list.append(step_out['z_probs'])
             priors_logits.append(step_out['prior_logits'])
             posts_logits.append(step_out['post_logits'])
+            
+            # features.append(feat_t)
+        recurrentStates = torch.stack(hs, dim=1)  # (B, T, deter_dim)
+        posteriors = torch.stack(zs, dim=1)  # (B, T, stoch_dim*discrete_dim)
+        # print(f"recurrentStates shape: {recurrentStates.shape}, posteriors shape: {posteriors.shape}")
+        full_state = torch.cat((recurrentStates, posteriors), dim=-1)  # (B, T, deter_dim + stoch_dim*discrete_dim)
+        # Heads
+        reconstructions_mean = self.decoder(full_state.view(B*T, -1)).view(B, T, *self.obs_shape)  # (B, T, C, H, W)
+        reconstruction_distribution = Independent(Normal(reconstructions_mean, 1.0), len(self.obs_shape))  # Assume fixed std for reconstruction loss
+        rewards_distribution = self.reward_head(full_state)
+        continues_logits = self.continue_head(full_state)
 
-            # Heads
-            recons.append(self.decoder(feat_t))
-            # RewardPredictor returns a Normal distribution per networks.py
-            rewards.append(self.reward_head(feat_t).mean)
-            # ContinuePredictor (as written) returns a distribution; keep logits/mean-like value
-            cont_dist = self.continue_head(feat_t)
-            if hasattr(cont_dist, 'logits'):
-                continues.append(cont_dist.logits)
-            else:
-                continues.append(cont_dist)
+        priors_stacked = torch.stack(priors_logits, dim=1)   # (B, T, stoch_dim, discrete_dim)
+        # Guard: posts_logits entries are None during pure imagination (embed=None).
+        # During training they are always set, but be defensive anyway.
+        posts_stacked = torch.stack(posts_logits, dim=1)  # (B, T, stoch_dim, discrete_dim)
 
         # Stack time dimension
         out = {
-            'reconstructions': torch.stack(recons, dim=1),          # (B, T, C, H, W)
-            'rewards': torch.stack(rewards, dim=1),                 # (B, T)
-            'continues': torch.stack(continues, dim=1),             # (B, T)
-            'priors_logits': torch.stack(priors_logits, dim=1),     # (B, T, stoch_dim, discrete_dim)
-            'posts_logits': torch.stack(posts_logits, dim=1),       # (B, T, stoch_dim, discrete_dim) (may contain None)
+            'reconstructions': reconstruction_distribution,         
+            'rewards': rewards_distribution,                
+            'continues': continues_logits,            
+            'priors_logits': priors_stacked,            # (B, T, stoch_dim, discrete_dim)
+            'posts_logits': posts_stacked,              # (B, T, stoch_dim, discrete_dim)
             'h': torch.stack(hs, dim=1),
             'z': torch.stack(zs, dim=1),
             'z_probs': torch.stack(z_probs_list, dim=1),
@@ -556,24 +567,14 @@ class DreamerV3(GRPBase):
             'critic_loss': critic_loss,
             'imagine_returns_mean': returns.mean().detach(),
         }
-
-    # [Imagine method remains mostly the same, ensuring valid input shapes for heads]
-    def preprocess_state(self, image):
-        """Preprocess observation image"""
-        img = self.resize_image(image)
-        img = self.normalize_state(img)
-        ## Change numpy array from channel-last to channel-first
-        img = np.transpose(img, (2, 0, 1))  # (H, W, C) -> (C, H, W)
-        # img = img.permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
-        return img
     
-    def compute_loss(self, output, images, rewards, dones, device):
+    def compute_loss(self, output, normalized_images, rewards, dones, device):
         """
         Compute the total loss for DreamerV3 model training.
         
         Args:
             output: Dictionary containing model outputs (reconstructions, rewards, continues, priors_logits, posts_logits)
-            images: Ground truth images tensor
+            normalized_images: Ground truth normalized_images tensor
             rewards: Ground truth rewards tensor
             dones: Ground truth done flags tensor
             device: Device to perform computations on
@@ -593,7 +594,7 @@ class DreamerV3(GRPBase):
         # TODO: Part 3.2 - Implement DreamerV3 loss computation
         ## Compute reconstruction, reward, KL divergence losses and combine them
         # Shapes we expect:
-        # - images: (B, T, C, H, W)
+        # - normalized_images: (B, T, C, H, W)
         # - rewards: (B, T) or (B, T, 1)
         # - dones: (B, T) or (B, T, 1)
         # - output['reconstructions']: (B, T, C, H, W)
@@ -605,8 +606,10 @@ class DreamerV3(GRPBase):
         pred_coeff = float(getattr(getattr(self._cfg, 'loss_coeffs', {}), 'pred_coeff', 1.0))
         dyn_coeff = float(getattr(getattr(self._cfg, 'loss_coeffs', {}), 'dyn_coeff', 1.0))
         rep_coeff = float(getattr(getattr(self._cfg, 'loss_coeffs', {}), 'rep_coeff', 0.1))
+        # Optional KL free nats
+        free_nats = 1.0
 
-        recons = output['reconstructions']
+        reconstruction_distribution = output['reconstructions']
         pred_rewards = output['rewards']
         cont_logits = output['continues']
         priors_logits = output['priors_logits']
@@ -618,38 +621,36 @@ class DreamerV3(GRPBase):
             dones = dones.squeeze(-1)
 
         # --- Reconstruction loss (pixel MSE in normalized space) ---
-        recon_loss = F.mse_loss(recons, images)
+        
+        recon_loss = -reconstruction_distribution.log_prob(normalized_images).mean()
 
         # --- Reward prediction loss ---
         # A simple, robust choice: MSE on raw rewards.
-        reward_loss = F.mse_loss(pred_rewards, rewards)
+        reward_loss = -pred_rewards.log_prob(rewards.squeeze(-1)).mean()
 
         # --- Continue prediction loss ---
-        # Continue = 1 - done
-        cont_target = (1.0 - dones.float()).to(cont_logits.device)
-        continue_loss = F.binary_cross_entropy_with_logits(cont_logits, cont_target)
+        not_done = (1.0 - dones.float()).to(device)
+        # `output['continues']` is a Bernoulli distribution returned from ContinuePredictor.
+        # Use its logits and BCEWithLogitsLoss for numerical stability. Ensure shapes match (B, T).
+        B, T = normalized_images.shape[0], normalized_images.shape[1]
+        cont_logits_tensor = cont_logits.logits if hasattr(cont_logits, 'logits') else cont_logits
+        cont_logits_tensor = cont_logits_tensor.view(B, T)
+        bce_fn = nn.BCEWithLogitsLoss(reduction='none')
+        continue_loss = bce_fn(cont_logits_tensor, not_done).mean()
 
         # --- KL losses between posterior and prior categorical latents ---
-        # posts_logits/priors_logits: (B, T, Z, C)
-        # Compute KL per (B,T,Z) and average.
-        # Use log-softmax for stability.
-        log_q = F.log_softmax(posts_logits, dim=-1)
-        log_p = F.log_softmax(priors_logits, dim=-1)
-        q = log_q.exp()
-        kl = (q * (log_q - log_p)).sum(dim=-1)  # (B, T, Z)
+        prior_distribution = Independent(OneHotCategoricalStraightThrough(logits=priors_logits), 1)
+        prior_distribution_sg = Independent(OneHotCategoricalStraightThrough(logits=priors_logits.detach()), 1)
+        post_distribution = Independent(OneHotCategoricalStraightThrough(logits=posts_logits), 1)
+        post_distribution_sg = Independent(OneHotCategoricalStraightThrough(logits=posts_logits.detach()), 1)
+        
+        prior_loss = kl_divergence(post_distribution_sg, prior_distribution)
+        post_loss = kl_divergence(post_distribution, prior_distribution_sg)
+        free_nats_tensor = torch.full_like(prior_loss, free_nats)
 
-        # Dreamer typically splits into:
-        # - dynamics loss: KL(post || prior) gradient flows into prior
-        # - representation loss: KL(post || prior) gradient flows into posterior
-        # We approximate this with stop-grad splits.
-        log_q_sg = log_q.detach()
-        q_sg = q.detach()
-        log_p_sg = log_p.detach()
+        dyn_loss = torch.maximum(prior_loss, free_nats_tensor).mean()
+        rep_loss = torch.maximum(post_loss, free_nats_tensor).mean()
 
-        dyn_kl = (q_sg * (log_q_sg - log_p)).sum(dim=-1)  # (B, T, Z)
-        rep_kl = (q * (log_q - log_p_sg)).sum(dim=-1)     # (B, T, Z)
-        dyn_loss = dyn_kl.mean()
-        rep_loss = rep_kl.mean()
 
         pred_loss = recon_loss + reward_loss + continue_loss
         total_loss = pred_coeff * pred_loss + dyn_coeff * dyn_loss + rep_coeff * rep_loss

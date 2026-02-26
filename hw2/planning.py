@@ -68,15 +68,15 @@ class CEMPlanner(Planner):
         self.to(self.device)
 
         # CEM hyperparameters (extract from cfg or set defaults)
-        self.H = getattr(cfg.planner, 'horizon', 12)  # Planning horizon
+        self.horizon = getattr(cfg.planner, 'horizon', 12)  # Planning horizon
         self.K = getattr(cfg.planner, 'num_samples', 100)  # Number of action sequences to sample
         self.M = getattr(cfg.planner, 'num_elites', 20)  # Number of elite sequences to select
         self.L = getattr(cfg.planner, 'num_iterations', 3)  # Number of CEM iterations
         self.alpha = getattr(cfg.planner, 'temperature', 0.1)  # Temperature for updating distribution
 
-        self.action_mean = torch.zeros(self.H, self.action_dim, device=self.cfg.device)  # Initial mean of action distribution
-        self.action_std = torch.ones(self.H, self.action_dim, device=self.cfg.device)  # Initial std of action distribution
-        
+        self.mu = torch.zeros(self.horizon, self.action_dim, device=self.cfg.device)  # Initial mean of action distribution
+        self.std = torch.ones(self.horizon, self.action_dim, device=self.cfg.device)  # Initial std of action distribution
+
     def plan(self, initial_state, return_best_sequence=True):
         """
         Plan action sequences using CEM to maximize predicted rewards.
@@ -94,12 +94,12 @@ class CEMPlanner(Planner):
         # TODO: Part 1.3 - Implement CEM planning algorithm
         ## Sample action sequences, evaluate with world model, select elites, update distribution
         # Reset action distribution each planning call to avoid bias from previous plans
-        action_mean = torch.zeros(self.H, self.action_dim, device=self.device)
-        action_std = torch.ones(self.H, self.action_dim, device=self.device)
+        mu = torch.zeros((self.horizon, self.action_dim), device=self.device)
+        std = torch.ones((self.horizon, self.action_dim), device=self.device)
         for iteration in range(self.L):
             # Sample action sequences from the current distribution
-            action_sequences = action_mean + action_std * torch.randn(self.K, self.H, self.action_dim, device=self.device)  # (K, H, action_dim)
-            
+            action_sequences = mu + std * torch.randn(self.K, self.horizon, self.action_dim, device=self.device)  # (K, H, action_dim)
+
             # Evaluate the sampled action sequences using the world model
             rewards = self._evaluate_sequences(initial_state, action_sequences)  # (K,)
             
@@ -108,15 +108,15 @@ class CEMPlanner(Planner):
             elite_action_sequences = action_sequences[elite_indices]  # (M, H, action_dim)
             
             # Update the mean and std of the action distribution using the elites
-            new_action_mean = elite_action_sequences.mean(dim=0)  # (H, action_dim)
+            new_mu = elite_action_sequences.mean(dim=0)  # (H, action_dim)
             # We could use unbiased=False to avoid NaN when M==1 (avoids division by N-1=0)
-            new_action_std = elite_action_sequences.std(dim=0, unbiased=True).clamp(min=1e-6)  # (H, action_dim)
+            new_std = elite_action_sequences.std(dim=0, unbiased=True).clamp(min=1e-6)  # (H, action_dim)
             
             # Smoothly update the distribution parameters with temperature alpha
-            action_mean = self.alpha * new_action_mean + (1 - self.alpha) * action_mean
-            action_std = self.alpha * new_action_std + (1 - self.alpha) * action_std
+            mu = self.alpha * new_mu + (1 - self.alpha) * mu
+            std = self.alpha * new_std + (1 - self.alpha) * std
             # Track best action sequence and reward for return
-            best_actions = elite_action_sequences[0] if return_best_sequence else action_mean  # (H, action_dim) - best sequence from elites
+            best_actions = elite_action_sequences[0] if return_best_sequence else mu  # (H, action_dim) - best sequence from elites
             best_reward = rewards[elite_indices[0]]  # Best reward from elites
 
         return best_actions, best_reward
@@ -152,8 +152,8 @@ class CEMPlanner(Planner):
 
         # action_sequences: (K, H, A)
         K, H, A = action_sequences.shape
-        if H != self.H:
-            raise ValueError(f"Expected action_sequences horizon {self.H}, got {H}")
+        if H != self.horizon:
+            raise ValueError(f"Expected action_sequences horizon {self.horizon}, got {H}")
         if A != self.action_dim:
             raise ValueError(f"Expected action_dim {self.action_dim}, got {A}")
 
@@ -182,7 +182,7 @@ class CEMPlanner(Planner):
         total_rewards = torch.zeros(K, device=device)
         wm.eval()
         with torch.no_grad():
-            for t in range(self.H):
+            for t in range(self.horizon):
                 a_t = action_sequences[:, t, :]
                 # RSSM imagination step: no embed -> sample from prior.
                 step_out = wm.rssm_step(state, a_t, embed=None)
@@ -213,7 +213,7 @@ class CEMPlanner(Planner):
         # 2. Initialize total rewards tensor on the same device as current_state
         total_rewards = torch.zeros(action_sequences.shape[0], device=self.cfg.device)  # (K,)
         # 3. Roll out each action sequence in the world model and accumulate rewards
-        for step in range(self.H):  # Iterate over each step in the horizon
+        for step in range(self.horizon):  # Iterate over each step in the horizon
             action = action_sequences[:, step, :].unsqueeze(1).to(self.cfg.device)  # (K, 1, action_dim)
             self.world_model.eval()  # Set world model to evaluation mode
             with torch.no_grad():  # Disable gradient computation for evaluation
@@ -312,10 +312,10 @@ class CEMPlanner(Planner):
         #1. Encode pose to get initial state for planning
         initial_state = {'pose': pose}  # (B, 1, pose_dim)
         #2. Plan using CEM to get action sequence and predicted reward
-        best_actions_seq, best_reward = self.plan(initial_state)
+        best_actions, best_reward = self.plan(initial_state)
         #3. Return the planned action sequence and predicted reward
         return {
-            'actions': best_actions_seq,  # (H, action_dim) or (action_dim,)
+            'actions': best_actions,  # (H, action_dim) or (action_dim,)
             'predicted_reward': best_reward,
             'final_state': initial_state  # Return the initial state used for planning (could also return the final state after rollout if desired)
         }
@@ -385,7 +385,7 @@ class PolicyPlanner(GRPBase):
         self.device = self.cfg.device
         self.to(self.device)
 
-        self.H = horizon if horizon is not None else getattr(cfg.planner, 'horizon', 12) # Planning horizon
+        self.horizon = horizon if horizon is not None else getattr(cfg.planner, 'horizon', 12) # Planning horizon
         self.optimizer = torch.optim.Adam(self.policy_model.parameters(), lr=getattr(cfg.planner, 'learning_rate', 0.001))
         self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=10, gamma=0.9)  # Example scheduler, can be configured as needed
         self.loss_fn = torch.nn.MSELoss()  # Example loss function for behavior cloning, can be changed based on the task
@@ -427,30 +427,53 @@ class PolicyPlanner(GRPBase):
         ## Train the policy using behavior cloning on collected state-action pairs
         # Check if any poses or actions contain NaNs and print a warning if so (debugging step)
         self.policy_model.train()
-        if torch.isnan(states).any():
-            print("Warning: NaNs detected in encoded states. Check data preprocessing and encoding.")
-            print(f"NaN count in states: {torch.isnan(states).sum().item()} out of {states.numel()}")
-        if torch.isnan(actions).any():
-            print("Warning: NaNs detected in encoded actions. Check data preprocessing and encoding.")
-            print(f"NaN count in actions: {torch.isnan(actions).sum().item()} out of {actions.numel()}")
-        # Flatten sequence dimension so the policy sees individual (pose -> action) pairs:
-        # (B, T, D) -> (B*T, D).  This matches eval-time where a single step is passed in.
-        if states.dim() == 3:
-            B, T, D = states.shape
-            states  = states.reshape(B * T, D)                    # (B*T, pose_dim)
-            actions = actions.reshape(B * T, self.action_dim)     # (B*T, action_dim)
+        B, T, action_dim = actions.shape
+        # check whether self.action_dim == action_dim
+        if self.action_dim != action_dim:
+            raise ValueError(f"Expected action dimension {self.action_dim}, got {action_dim}")
+        else:
+            actions = actions.view(B * T, action_dim)  # Flatten actions to (B*T, action_dim) for loss computation
+        if self.cfg.model_type == 'simple':
+            # Flatten sequence dimension so the policy sees individual (pose -> action) pairs:
+            # (B, T, D) -> (B*T, D).  This matches eval-time where a single step is passed in.
+            policy_input = states.view(B * T, -1)  # (B*T, pose_dim)
+        elif self.cfg.model_type == 'dreamer':
+            # --- NEW Part 4.1: Dreamer Image Logic ---
+            B, T, C, H, W = states.shape
+            obs_flat = states.view(B * T, C, H, W)  # Flatten time dimension
 
+            # Use the World Model to encode the images into latent states for the policy.
+            with torch.no_grad():
+                embed_flat = self.world_model.encoder(obs_flat)  # (B*T, embed_dim)
+                embed = embed_flat.view(B, T, -1)  # (B, T, hidden_dim)
+                state = self.world_model.get_initial_state(B, device=self.device)  # Initialize RSSM state
+                previous_actions = torch.zeros(B, self.action_dim, device=self.device)  # Start with zero actions
+
+                hz_list = []
+                for t in range(T):
+                    e_t = embed[:, t, :]
+                    step_out = self.world_model.rssm_step(state, previous_actions, embed=e_t)
+                    state = {
+                        'h': step_out['h'],
+                        'z': step_out['z'],
+                        'z_probs': step_out.get('z_probs', None),
+                    }
+                    hz_list.append(torch.cat([state['h'], state['z']], dim=-1))  # (B, deter_dim + stoch_dim*discrete_dim)
+            policy_input = torch.stack(hz_list, dim=1).view(B * T, -1)  # (B*T, deter_dim + stoch_dim*discrete_dim)
         # Policy outputs (B, action_dim*2): first half = mean, second half = log_std
-        predicted_actions_distribution = self.policy_model(states)  # (B, action_dim*2)
-        predicted_actions_mean = predicted_actions_distribution[:, :self.action_dim]   # (B, action_dim)
-        predicted_actions_std = predicted_actions_distribution[:, self.action_dim:]  # (B, action_dim)
+        policy_output = self.policy_model(policy_input)  # (B*T, action_dim*2)
+        mean, log_std = torch.chunk(policy_output, 2, dim=-1)   # (B*T, action_dim)
+        log_std = torch.clamp(log_std, min=-5.0, max=2.0)
+        std = torch.exp(log_std)
+        dist = torch.distributions.Normal(mean, std)
+        loss = -dist.log_prob(actions).mean()
         self.optimizer.zero_grad()
         # Use mean for deterministic behaviour cloning loss
-        loss = self.loss_fn(predicted_actions_mean, actions)  # MSE loss between predicted mean actions and true actions
         loss.backward()
         # Clip gradients to prevent large updates from destabilising training
         torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), max_norm=1.0)
         self.optimizer.step()
+
         return loss.item()  # Return average loss across epochs for monitoring
 
     
@@ -473,26 +496,43 @@ class PolicyPlanner(GRPBase):
         # Get the current conditioning feature for the policy.
         # - Simple: uses encoded pose.
         # - Dreamer: uses RSSM feature [h, z].
-        if self.cfg.model_type == 'dreamer':
-            if not isinstance(initial_state, dict) or 'h' not in initial_state or 'z' not in initial_state:
-                raise ValueError("Dreamer PolicyPlanner.plan requires RSSM state dict with keys {'h','z'}")
-            feat = torch.cat([initial_state['h'], initial_state['z']], dim=-1)
-            current_state = feat
-        else:
-            current_state = initial_state['pose']
-            if current_state.dim() == 3:
-                current_state = current_state.squeeze(1)
+        mu = torch.zeros((self.horizon, self.action_dim), device=self.device)
+        std = torch.zeros((self.horizon, self.action_dim), device=self.device)
 
-        self.policy_model.eval()  # Set policy to evaluation mode for planning
-        with torch.no_grad():
-            action_distribution = self.policy_model(current_state)  # (B, action_dim*2)
-
-        action_mean = action_distribution[:, :self.action_dim].unsqueeze(1)  # (B,1,A)
-        action_std = action_distribution[:, self.action_dim:].unsqueeze(1)   # (B,1,A)
+        if self.cfg.model_type == 'simple':
+            pose = initial_state['pose']
+            if pose.dim() == 1: pose = pose.unsqueeze(0)
+            current_state = pose  # (B, pose_dim)
+            
+            for t in range(self.horizon):
+                with torch.no_grad():
+                    policy_out = self.policy_model(current_state)
+                    step_mean, step_log_std = torch.chunk(policy_out, 2, dim=-1)
+                    
+                    mu[t] = step_mean.squeeze(0)
+                    std[t] = torch.exp(step_log_std).clamp(min=1e-3, max=1.0).squeeze(0)
+                    current_state, _ = self.world_model.forward(current_state, step_mean)
+        elif self.cfg.model_type == 'dreamer':
+            current_state = initial_state
+            for t in range(self.horizon):
+                with torch.no_grad():
+                    policy_out = self.policy_model(torch.cat([current_state['h'], current_state['z']], dim=-1))
+                    step_mean, step_log_std = torch.chunk(policy_out, 2, dim=-1)
+                    
+                    mu[t] = step_mean.squeeze(0)
+                    std[t] = torch.exp(step_log_std).clamp(min=1e-3, max=1.0).squeeze(0)
+                    # RSSM imagination step: no embed -> sample from prior.
+                    step_out = self.world_model.rssm_step(current_state, step_mean, embed=None)
+                    current_state = {
+                        'h': step_out['h'],
+                        'z': step_out['z'],
+                        'z_probs': step_out.get('z_probs', None),
+                    }
+        # ---- CEM Refinement Loop ----
         for iteration in range(self.L):
             # Sample action sequences from the current distribution
-            action_sequences = action_mean + action_std * torch.randn(self.K, self.H, self.action_dim, device=self.device)  # (K, H, action_dim)
-            
+            action_sequences = mu + std * torch.randn(self.K, self.horizon, self.action_dim, device=self.device)  # (K, H, action_dim)
+
             # Evaluate the sampled action sequences using the world model
             rewards = self._evaluate_sequences(initial_state, action_sequences)  # (K,)
             
@@ -501,15 +541,15 @@ class PolicyPlanner(GRPBase):
             elite_action_sequences = action_sequences[elite_indices]  # (M, H, action_dim)
             
             # Update the mean and std of the action distribution using the elites
-            new_action_mean = elite_action_sequences.mean(dim=0)  # (H, action_dim)
+            new_mu = elite_action_sequences.mean(dim=0)  # (H, action_dim)
             # We could use unbiased=False to avoid NaN when M==1 (avoids division by N-1=0)
-            new_action_std = elite_action_sequences.std(dim=0, unbiased=True).clamp(min=1e-6)  # (H, action_dim)
+            new_std = elite_action_sequences.std(dim=0, unbiased=True).clamp(min=1e-6)  # (H, action_dim)
             
             # Smoothly update the distribution parameters with temperature alpha
-            action_mean = self.alpha * new_action_mean + (1 - self.alpha) * action_mean
-            action_std = self.alpha * new_action_std + (1 - self.alpha) * action_std
+            mu = self.alpha * new_mu + (1 - self.alpha) * mu
+            std = self.alpha * new_std + (1 - self.alpha) * std
             # Track best action sequence and reward for return
-            best_actions = elite_action_sequences[0] if return_best_sequence else action_mean  # (H, action_dim) - best sequence from elites
+            best_actions = elite_action_sequences[0] if return_best_sequence else mu  # (H, action_dim) - best sequence from elites
             best_reward = rewards[elite_indices[0]]  # Best reward from elites
 
         return best_actions, best_reward
@@ -545,8 +585,8 @@ class PolicyPlanner(GRPBase):
 
         # action_sequences: (K, H, A)
         K, H, A = action_sequences.shape
-        if H != self.H:
-            raise ValueError(f"Expected action_sequences horizon {self.H}, got {H}")
+        if H != self.horizon:
+            raise ValueError(f"Expected action_sequences horizon {self.horizon}, got {H}")
         if A != self.action_dim:
             raise ValueError(f"Expected action_dim {self.action_dim}, got {A}")
 
@@ -574,7 +614,7 @@ class PolicyPlanner(GRPBase):
         total_rewards = torch.zeros(K, device=device)
         wm.eval()
         with torch.no_grad():
-            for t in range(self.H):
+            for t in range(self.horizon):
                 a_t = action_sequences[:, t, :]
                 step_out = wm.rssm_step(state, a_t, embed=None)  # imagination step
                 h = step_out['h']
@@ -598,7 +638,7 @@ class PolicyPlanner(GRPBase):
         # 2. Initialize total rewards tensor on the same device as current_state
         total_rewards = torch.zeros(action_sequences.shape[0], device=self.cfg.device)  # (K,)
         # 3. Roll out each action sequence in the world model and accumulate rewards
-        for step in range(self.H):  # Iterate over each step in the horizon
+        for step in range(self.horizon):  # Iterate over each step in the horizon
             action = action_sequences[:, step, :].unsqueeze(1).to(self.cfg.device)  # (K, 1, action_dim)
             self.world_model.eval()  # Set world model to evaluation mode
             with torch.no_grad():  # Disable gradient computation for evaluation
@@ -639,12 +679,12 @@ class PolicyPlanner(GRPBase):
             self.policy_model.eval()  # Set policy model to evaluation mode for planning
             with torch.no_grad():  # Ensure no gradients are computed during planning
                 # print(f"Shape of input pose: {pose.shape}")  # Debugging print to check input shape
-                actions = self.policy_model(self.world_model.encode_pose(pose.squeeze(1)))  # Get action distribution from policy model
+                actions = self.policy_model(pose.squeeze(1))  # Get action distribution from policy model
                 # print(f"Shape of policy output: {actions.shape}")  # Debugging print to check output shape
-            action_mean = actions[:, :self.action_dim]  # Extract mean (B, action_dim)
-            action_std = actions[:, self.action_dim:]  # Extract std (B, action_dim)
-            # print(f"Action mean shape: {action_mean.shape}, Action std shape: {action_std.shape}")  # Debugging print to check shapes
-            sampled_actions = action_mean  # For deterministic policy; for stochastic, you would sample from the distribution using action_mean and action_std
+            mu = actions[:, :self.action_dim]  # Extract mean (B, action_dim)
+            std = actions[:, self.action_dim:]  # Extract std (B, action_dim)
+            # print(f"Action mean shape: {mu.shape}, Action std shape: {std.shape}")  # Debugging print to check shapes
+            sampled_actions = mu  # For deterministic policy; for stochastic, you would sample from the distribution using mu and std
             return {
                 'actions': sampled_actions,  # (1, action_dim)
                 'predicted_reward': None,  # Predicted reward is not computed here since we're directly using the policy's output; could be computed by rolling out in the world model if desired
