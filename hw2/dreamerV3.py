@@ -472,13 +472,13 @@ class DreamerV3(GRPBase):
         # Apply free_nats AFTER averaging so the floor is on the scalar loss,
         # not per-element (per-element flooring permanently hides improvement).
         dyn_loss = torch.maximum(
-            kl_divergence(post_distribution_sg, prior_distribution).mean(),
+            kl_divergence(post_distribution_sg, prior_distribution),
             torch.tensor(free_nats, device=device)
-        )
+        ).mean()
         rep_loss = torch.maximum(
-            kl_divergence(post_distribution, prior_distribution_sg).mean(),
+            kl_divergence(post_distribution, prior_distribution_sg),
             torch.tensor(free_nats, device=device)
-        )
+        ).mean()
 
 
         pred_loss = recon_loss + reward_loss + continue_loss

@@ -108,6 +108,7 @@ def batch_data(dataset, batch_size, cfg):
     rewards = pad_sequence(list_rewards, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T)
     dones = pad_sequence(list_dones, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T)
     poses = pad_sequence(list_poses, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T, pose_dim)
+    print(f"[info] Batched data into tensors with shapes: images={images.shape}, actions={actions.shape}, rewards={rewards.shape}, dones={dones.shape}, poses={poses.shape}")
     out_dataset = torch.utils.data.TensorDataset(images, actions, rewards, dones, poses)
     print(f"[info] Created DataLoader with {len(out_dataset)} samples")
     return torch.utils.data.DataLoader(out_dataset, batch_size=batch_size, shuffle=True)

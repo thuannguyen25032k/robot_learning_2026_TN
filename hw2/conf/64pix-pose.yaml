@@ -69,7 +69,7 @@ simEval: ["libero"]
 sim:
   eval_episodes: 1
   eval_tasks: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # List of task indices to evaluate on; length should match eval_episodes
-  episode_length: 300
+  episode_length: 200
   task_set: "libero_spatial"
   libero_init_state_file: "/openvla/experiments/robot/libero/libero_spatial_init_states_and_goals.hdf"
   libero_init_state_hf_repo: "gberseth/libero_spatial_init_states"
