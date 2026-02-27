@@ -41,7 +41,7 @@ class SimpleWorldModel(GRPBase):
         ## Define the feature network and output heads (pose and reward)
         super(SimpleWorldModel, self).__init__(cfg)
         input_dim = pose_dim + action_dim
-        n_blocks = 6  # preferred 6-8 blocks; set to 6 by default
+        n_blocks = 4  # preferred 6-8 blocks; set to 4 by default
 
         self.input_proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),

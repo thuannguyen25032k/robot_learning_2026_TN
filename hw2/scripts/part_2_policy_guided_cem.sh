@@ -6,6 +6,7 @@ python dreamer_model_trainer.py \
     planner.num_samples=50 \
     planner.num_elites=5 \
     +load_policy=checkpoints/q2_policy_training/policy.pth \
+    +load_world_model=checkpoints/q1_world_model_training/world_model.pth \
     exp_name=q2_policy_cem \
     experiment.name=q2_policy_cem \
     use_policy=true

@@ -214,7 +214,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
     trajectory_data = []
     # retrieve a specific task
     tasks = cfg.sim.eval_tasks
-    for task_id in tasks:
+    for idx, task_id in enumerate(tasks):
         task = task_suite.get_task(task_id)
         task_name = task.name
         instruction = task.language
@@ -379,7 +379,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
             os.makedirs(video_dir, exist_ok=True)
             sub_video_dir = os.path.join(video_dir, f"{cfg.experiment.name}")
             os.makedirs(sub_video_dir, exist_ok=True)
-            path_ = os.path.join(sub_video_dir, f"libero-{iter_}-task-id-{task_id}-init-id-{init_state_id}.mp4")
+            path_ = os.path.join(sub_video_dir, f"libero-{iter_}-task-id-{task_id}-idx-{idx}-init-id-{init_state_id}.mp4")
             import imageio
             imageio.mimsave(path_, frames, fps=20)
     episode_stats = info.get('episode_stats', {})

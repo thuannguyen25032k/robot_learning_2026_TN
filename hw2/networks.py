@@ -22,7 +22,10 @@ class EncoderConv(nn.Module):
             nn.ReLU(),
             nn.Flatten(),  # (B, 256 * H/16 * W/16)
             nn.Linear(256 * (height // 16) * (width // 16), output_dim),
-            nn.ReLU()
+            # No activation here: the embedding should be unbounded so the
+            # posterior net (PosteriorNet) receives the full-range representation.
+            # A final ReLU would zero-clamp half the features and starve the
+            # posterior of information, causing recon_loss to increase.
         )
 
     def forward(self, x):

@@ -31,6 +31,7 @@ import random
 from collections import deque
 from datasets import load_dataset
 import datasets
+from torch.nn.utils.rnn import pad_sequence
 
 
 
@@ -78,24 +79,35 @@ def batch_data(dataset, batch_size, cfg):
     - poses: (B, T, 7)
     """
     # Collect sequences for the batch with fixed sequence length
-    print(f"[info] Batching data with batch_size={batch_size}, sequence_length={cfg.policy.sequence_length}")
-    images, actions, rewards, dones, poses = [], [], [], [], []
+    list_images, list_actions, list_rewards, list_dones, list_poses = [], [], [], [], []
+    # padding short trajectories to max_seq_len with zeros
+    # for img, act, rew, don, pos in dataset:
+    #     images += [img[i:i+cfg.policy.sequence_length] for i in range(0, len(img)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+    #     actions += [act[i:i+cfg.policy.sequence_length] for i in range(0, len(act)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+    #     rewards += [rew[i:i+cfg.policy.sequence_length] for i in range(0, len(rew)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+    #     dones += [don[i:i+cfg.policy.sequence_length] for i in range(0, len(don)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+    #     poses += [pos[i:i+cfg.policy.sequence_length] for i in range(0, len(pos)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+    # images = torch.stack(images)  # (B, T, H, W, C)
+    # actions = torch.stack(actions)  # (B, T, action_dim)
+    # rewards = torch.stack(rewards)  # (B, T)
+    # dones = torch.stack(dones)  # (B, T)
+    # poses = torch.stack(poses)  # (B, T, pose_dim)
+    # images = images.permute(0, 1, 4, 2, 3).to(cfg.device)  # (B, T, H, W, C) -> (B, T, C, H, W)
+    # actions = actions.float().to(cfg.device) # (B, T, action_dim)
+    # rewards = rewards.float().to(cfg.device) # (B, T)
+    # dones = dones.float().to(cfg.device) # (B, T)
+    # poses = poses.float().to(cfg.device) # (B, T, pose_dim)
     for img, act, rew, don, pos in dataset:
-        images += [img[i:i+cfg.policy.sequence_length] for i in range(0, len(img)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
-        actions += [act[i:i+cfg.policy.sequence_length] for i in range(0, len(act)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
-        rewards += [rew[i:i+cfg.policy.sequence_length] for i in range(0, len(rew)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
-        dones += [don[i:i+cfg.policy.sequence_length] for i in range(0, len(don)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
-        poses += [pos[i:i+cfg.policy.sequence_length] for i in range(0, len(pos)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
-    images = torch.stack(images)  # (B, T, H, W, C)
-    actions = torch.stack(actions)  # (B, T, action_dim)
-    rewards = torch.stack(rewards)  # (B, T)
-    dones = torch.stack(dones)  # (B, T)
-    poses = torch.stack(poses)  # (B, T, pose_dim)
-    images = images.permute(0, 1, 4, 2, 3).to(cfg.device)  # (B, T, H, W, C) -> (B, T, C, H, W)
-    actions = actions.float().to(cfg.device) # (B, T, action_dim)
-    rewards = rewards.float().to(cfg.device) # (B, T)
-    dones = dones.float().to(cfg.device) # (B, T)
-    poses = poses.float().to(cfg.device) # (B, T, pose_dim)
+        list_images.append(img)  # (T, H, W, C)
+        list_actions.append(act)  # (T, action_dim)
+        list_rewards.append(rew)  # (T,)
+        list_dones.append(don)  # (T,)
+        list_poses.append(pos)  # (T, pose_dim)
+    images = pad_sequence(list_images, batch_first=True, padding_value=0.0).permute(0, 1, 4, 2, 3).to(cfg.device)  # (B, T, H, W, C) -> (B, T, C, H, W)
+    actions = pad_sequence(list_actions, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T, action_dim)
+    rewards = pad_sequence(list_rewards, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T)
+    dones = pad_sequence(list_dones, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T)
+    poses = pad_sequence(list_poses, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T, pose_dim)
     out_dataset = torch.utils.data.TensorDataset(images, actions, rewards, dones, poses)
     print(f"[info] Created DataLoader with {len(out_dataset)} samples")
     return torch.utils.data.DataLoader(out_dataset, batch_size=batch_size, shuffle=True)
@@ -440,6 +452,9 @@ def my_main(cfg: DictConfig):
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     wandb = None
+    os.makedirs("checkpoints", exist_ok=True)
+    subcheckpoint_dir = os.path.join("checkpoints", f"{cfg.experiment.name}")
+    os.makedirs(subcheckpoint_dir, exist_ok=True)
     if not cfg.testing:
         import wandb
         # start a new wandb run to track this script
@@ -495,6 +510,7 @@ def my_main(cfg: DictConfig):
         if cfg.planner.type == 'policy_guided_cem':
             # Load pretrained policy model for policy-guided CEM
             planner.load_policy_model(cfg.load_policy)
+            planner.load_world_model(cfg.load_world_model)
     else:
         planner = CEMPlanner(
             model,
@@ -520,7 +536,7 @@ def my_main(cfg: DictConfig):
                 cfg.dataset, 'data_dir', '/network/projects/real-g-grp/libero/targets_clean/')
             dataset = LIBERODataset(data_dir, transform=transforms.ToTensor())
 
-    batch_size = 64
+    batch_size = 32
     cfg.policy.sequence_length = 16
     # Define optimizer and loss function
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -542,7 +558,7 @@ def my_main(cfg: DictConfig):
         policy_loss = 0.0
         batch_counter = 0
         # Accumulate all encoded poses and actions for policy training at the end of the epoch
-        if epoch == 0 or (epoch % cfg.eval_vid_iters == 0):
+        if epoch == 0 or ((epoch-1) % cfg.eval_vid_iters == 0):
             print(f"[info] Starting epoch {epoch+1}/{cfg.max_iters} with {len(dataset)} trajectories in dataset")
             # Batch data using the batch_data utility function
             dataloader = batch_data(dataset, batch_size=batch_size, cfg=cfg)
@@ -595,7 +611,7 @@ def my_main(cfg: DictConfig):
             optimizer.zero_grad()
             batch_loss.backward()
             # Clip gradients to prevent large updates from destabilising training
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=100.0)
             optimizer.step()
             loss = batch_loss.item()
             batch_counter += 1
@@ -632,10 +648,7 @@ def my_main(cfg: DictConfig):
             wandb.log(log_payload)
 
         # save the model checkpoint
-        if (epoch+1) % cfg.eval_vid_iters == 0:
-            os.makedirs("checkpoints", exist_ok=True)
-            subcheckpoint_dir = os.path.join("checkpoints", f"{cfg.experiment.name}")
-            os.makedirs(subcheckpoint_dir, exist_ok=True)
+        if epoch % cfg.eval_vid_iters == 0:
             torch.save(model.state_dict(), os.path.join(subcheckpoint_dir, f'model_epoch_{epoch+1}_batch_{batch_counter}.pth'), pickle_module=dill)
             # Save policy model if using policy-based planner
             if cfg.use_policy and cfg.planner.type=='policy':
@@ -652,13 +665,6 @@ def my_main(cfg: DictConfig):
             if cfg.use_random_data:
                 # Add new random trajectories to the buffer
                 for traj in data['traj']:
-                    # Check for NaNs in poses and actions
-                    if np.isnan(traj['poses']).any():
-                        print("Warning: NaNs detected in trajectory poses. Check data collection.")
-                        print(f"NaN count in poses: {np.isnan(traj['poses']).sum()} out of {traj['poses'].size}")
-                    if np.isnan(traj['actions']).any():
-                        print("Warning: NaNs detected in trajectory actions. Check data collection.")
-                        print(f"NaN count in actions: {np.isnan(traj['actions']).sum()} out of {traj['actions'].size}")
                     dones = np.zeros_like(traj['rewards'])
                     dones[-1] = 1
                     # observations need to be changed to channel first
@@ -675,7 +681,7 @@ def my_main(cfg: DictConfig):
         scheduler.step()
         print(
             f'Learning rate after epoch {epoch+1}: {scheduler.get_last_lr()[0]:.6f}')
-
+    torch.save(model.state_dict(), os.path.join(subcheckpoint_dir, f'world_model.pth'), pickle_module=dill)
 
 if __name__ == '__main__':
     my_main()

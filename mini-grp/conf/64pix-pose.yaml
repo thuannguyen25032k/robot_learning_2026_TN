@@ -1,0 +1,65 @@
+defaults:
+  - dataset: libero
+
+
+experiment:
+  name: mini_grp
+  project: mini-grp
+  description: "simple env with 64pix images and pose data"
+
+# Model type: "transformer" or "convnet"
+model: 
+  type: "transformer"
+
+batch_size: 256 # how many independent sequences will we process in parallel?
+max_block_size: 16 ## Tokens for langauge processing
+vocab_size: 32 ## Will be overidden by code
+action_space: "continuous" # "continuous" or "discrete"
+n_patches: 8
+patch_size: 8
+max_iters: 25000
+eval_interval: 100 # How often to run eval over the validation set
+learning_rate: 3e-4
+lr_schedule: linear ## ['inverse_sqrt', 'linear']
+eval_iters: 5
+policy:
+  action_stacking: 1
+  obs_stacking: 1
+  use_image_augmentations: false
+  dtype: 'float32'
+  use_pose_data: 1
+  random_masking_enabled: false  # Set to false to skip random masking, true to enable it
+
+testing: false
+eval_vid_iters: 25000000
+gradient_accumulation_steps: 1
+
+simEval: ["simple_env"] # "simpler_env" or "libero"
+sim:
+  eval_episodes: 1
+  eval_tasks: [0, 1, 2, 3]
+  episode length: 500
+
+# ------------
+
+r_seed: 1337
+device: "cuda"
+n_embd: 512
+n_head: 16
+n_blocks: 4
+dropout: 0.2
+action_dim: 7
+load_action_bounds: true
+
+
+## Model hyperparameters
+image_shape: [64, 64, 3]
+data_shuffel_interval: 1000 ## How often to reshuffle the data buffer, grabbing new random sequences from the cloud.
+
+profiler:
+  enable: false
+  params:
+    # record_shapes: true
+    profile_memory: true
+    with_stack: true
+    use_cuda: true

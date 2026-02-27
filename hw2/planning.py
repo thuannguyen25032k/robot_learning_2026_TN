@@ -6,6 +6,8 @@ except ImportError:
     from dreamerV3 import GRPBase
 import numpy as np
 import torch
+import os
+from pathlib import Path
 
 
 class Planner(GRPBase):
@@ -95,11 +97,14 @@ class CEMPlanner(Planner):
         ## Sample action sequences, evaluate with world model, select elites, update distribution
         # Reset action distribution each planning call to avoid bias from previous plans
         mu = torch.zeros((self.horizon, self.action_dim), device=self.device)
-        std = torch.ones((self.horizon, self.action_dim), device=self.device)
+        std = torch.ones((self.horizon, self.action_dim), device=self.device)*6
+        # top_std = self.world_model.encode_action(torch.ones_like(mu))
+        # bottom_std = self.world_model.encode_action(-torch.ones_like(mu))
+
         for iteration in range(self.L):
             # Sample action sequences from the current distribution
             action_sequences = mu + std * torch.randn(self.K, self.horizon, self.action_dim, device=self.device)  # (K, H, action_dim)
-
+            # action_sequences = torch.clamp(action_sequences, bottom_std, top_std)  # Ensure actions are within valid range
             # Evaluate the sampled action sequences using the world model
             rewards = self._evaluate_sequences(initial_state, action_sequences)  # (K,)
             
@@ -120,7 +125,7 @@ class CEMPlanner(Planner):
             best_reward = rewards[elite_indices[0]]  # Best reward from elites
 
         return best_actions, best_reward
-    
+
     def _evaluate_sequences(self, initial_state, action_sequences):
         """
         Evaluate a batch of action sequences by rolling them out in the world model.
@@ -396,11 +401,22 @@ class PolicyPlanner(GRPBase):
         # self.training_epochs = getattr(cfg.training, 'num_epochs', 3)  # Small: outer loop already iterates epochs
         self.batch_size = getattr(cfg, 'batch_size', 64)  # Batch size for training the policy
 
+    def load_world_model(self, path):
+        """Load pretrained world model from checkpoint."""
+
+        # Hydra may change the working directory (e.g., into `outputs/...`).
+        # Resolve relative paths against the hw2 folder (where `checkpoints/` lives).
+        p = os.path.expandvars(os.path.expanduser(str(path)))
+        p_path = Path(p)
+        if not p_path.is_absolute():
+            hw2_root = Path(__file__).resolve().parent
+            p_path = (hw2_root / p_path).resolve()
+
+         # Safer loading: `weights_only=True` avoids unpickling arbitrary objects.
+        self.world_model.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
+
     def load_policy_model(self, path):
         """Load pretrained policy model from checkpoint."""
-        import os
-        from pathlib import Path
-
         # Hydra may change the working directory (e.g., into `outputs/...`).
         # Resolve relative paths against the hw2 folder (where `checkpoints/` lives).
         p = os.path.expandvars(os.path.expanduser(str(path)))

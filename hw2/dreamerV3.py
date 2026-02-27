@@ -230,28 +230,23 @@ class DreamerV3(GRPBase):
                 f"logits must have shape (B, stoch_dim, discrete_dim) or (B, stoch_dim*discrete_dim); got {tuple(logits.shape)}"
             )
 
-        # Categorical probabilities (useful for logging / KL computation).
-        probs = torch.softmax(logits, dim=-1)
-
-        # Optional unimix smoothing for stability.
-        unimix = 0.01
-        if unimix > 0.0:
-            uniform = torch.ones_like(probs) / self.discrete_dim
-            probs = (1.0 - unimix) * probs + unimix * uniform
-
-        # For sampling we want logits corresponding to the (possibly unimixed) probs.
-        logits_for_sampling = probs_to_logits(probs)
-
+        # Sample directly from the raw network logits.
+        # IMPORTANT: do NOT do a probs_to_logits(softmax(logits)) round-trip here.
+        # That conversion introduces numerical error that accumulates across time steps
+        # and makes the KL (rep_loss / dyn_loss) measure a slightly different distribution
+        # from what was actually sampled, causing rep_loss to diverge.
         if training:
             # Straight-through one-hot categorical sampling so gradients can flow.
-            z = Independent(OneHotCategoricalStraightThrough(logits=logits_for_sampling), 1).rsample()  # (B, stoch_dim, discrete_dim)
+            z = Independent(OneHotCategoricalStraightThrough(logits=logits), 1).rsample()  # (B, stoch_dim, discrete_dim)
         else:
             # Deterministic mode for evaluation/planning.
-            idx = torch.argmax(logits_for_sampling, dim=-1)  # (B, stoch_dim)
+            idx = torch.argmax(logits, dim=-1)  # (B, stoch_dim)
             z = torch.nn.functional.one_hot(idx, num_classes=self.discrete_dim).to(logits.dtype)
 
         # Flatten to match the rest of the model which expects (B, stoch_dim * discrete_dim)
         z_flat = z.view(z.shape[0], self.stoch_dim * self.discrete_dim)
+        # Return probs for state bookkeeping (z_probs is only used for get_initial_state / logging).
+        probs = torch.softmax(logits, dim=-1)
         return z_flat, probs
 
     def rssm_step(self, prev_state, action, embed=None):
@@ -281,23 +276,21 @@ class DreamerV3(GRPBase):
             post_in = torch.cat([h, embed], dim=-1) # (B, deter_dim + hidden_dim): combine deterministic state and observation embedding for posterior computation
             post_logits = self.post_net(post_in)  # (B, stoch_dim, discrete_dim): the posterior distribution over the stochastic state based on the new deterministic state and the current observation embedding
             z, z_probs = self.sample_stochastic(post_logits, training=self.training)    # Sample from the posterior during training, and use argmax during evaluation
-            final_post_logits = probs_to_logits(z_probs)  # Convert back to logits for KL divergence computation in loss
             return {
                 'h': h,
                 'z': z,
                 'z_probs': z_probs,
                 'prior_logits': prior_logits,
-                'post_logits': final_post_logits,
+                'post_logits': post_logits,
             }
 
         # 4) Otherwise, sample from the prior (imagination / rollout)
         z, z_probs = self.sample_stochastic(prior_logits, training=self.training)
-        final_prior_logits = probs_to_logits(z_probs)  # Convert back to logits for KL divergence computation in loss
         return {
             'h': h,
             'z': z,
             'z_probs': z_probs,
-            'prior_logits': final_prior_logits,
+            'prior_logits': prior_logits,
             'post_logits': None,
         }
 
@@ -338,8 +331,14 @@ class DreamerV3(GRPBase):
         rewards, continues = [], []     # rewards: predicted rewards, continues: predicted continue logits
         features = []   # features: combined [h,z] for each time step, used for actor/critic heads if needed
 
+        # The RSSM convention: h_t is computed from (h_{t-1}, z_{t-1}, a_{t-1}).
+        # So at step t we feed the *previous* action a_{t-1}.
+        # At t=0 the previous action is zeros (already encoded in the initial state).
+        zero_action = torch.zeros(B, self.action_dim, device=device, dtype=prev_actions.dtype)
+
         for t in range(T):
-            a_t = prev_actions[:, t, :]     # (B, action_dim): the action taken at time t
+            # Previous action: zeros at t=0, else prev_actions[:, t-1, :]
+            a_t = zero_action if t == 0 else prev_actions[:, t - 1, :]   # (B, action_dim): action taken *before* observing step t
             e_t = embed[:, t, :]    # (B, hidden_dim): the encoded observation at time t
 
             step_out = self.rssm_step(state, a_t, embed=e_t)    # (B, deter_dim), (B, stoch_dim*discrete_dim), (B, stoch_dim, discrete_dim), (B, stoch_dim, discrete_dim)
@@ -388,185 +387,6 @@ class DreamerV3(GRPBase):
             'final_state': state,
         }
         return out
-
-    def get_feat(self, state_or_output):
-        """Return Dreamer feature = concat([h, z])
-
-        Accepts either:
-        - a state dict with keys {'h','z'}
-        - a forward() output dict with keys {'h','z'} shaped (B,T,*)
-        """
-        if isinstance(state_or_output, dict) and 'h' in state_or_output and 'z' in state_or_output:
-            h = state_or_output['h']
-            z = state_or_output['z']
-            return torch.cat([h, z], dim=-1)
-        raise ValueError("get_feat expected a dict with keys 'h' and 'z'")
-
-    @torch.no_grad()
-    def _encode_obs_seq(self, observations):
-        """Encode (B,T,C,H,W) -> (B,T,E)."""
-        if observations.dim() != 5:
-            raise ValueError(f"observations must have shape (B,T,C,H,W); got {tuple(observations.shape)}")
-        B, T, C, H, W = observations.shape
-        obs_flat = observations.reshape(B * T, C, H, W)
-        embed_flat = self.encoder(obs_flat)
-        return embed_flat.view(B, T, -1)
-
-    def imagine(self, start_state, horizon, deterministic=False):
-        """Imagine a rollout in latent space starting from `start_state`.
-
-        Args:
-            start_state: dict containing {'h','z','z_probs'} for time t=0
-            horizon: number of imagined transitions
-            deterministic: if True, use actor mean action (via eval-mode sampling)
-
-        Returns:
-            dict with keys:
-              - feat: (B, H, F)
-              - actions: (B, H, A)
-              - rewards: (B, H)
-              - continues: (B, H) in [0,1]
-              - values: (B, H) critic mean
-        """
-        if horizon <= 0:
-            raise ValueError(f"horizon must be > 0, got {horizon}")
-
-        B = start_state['h'].shape[0]
-        device = start_state['h'].device
-
-        # We'll roll forward using the prior (embed=None).
-        state = {
-            'h': start_state['h'],
-            'z': start_state['z'],
-            'z_probs': start_state.get('z_probs', torch.zeros(B, self.stoch_dim, self.discrete_dim, device=device)),
-        }
-
-        feats, actions, rewards, continues, values = [], [], [], [], []
-
-        for _ in range(horizon):
-            feat = self.get_feat(state)  # (B, F)
-            # ActorNet.forward returns an action; it supports training flag but we want differentiable path
-            # through world model, not through environment.
-            if deterministic:
-                # crude deterministic by temporarily switching training=False
-                a = self.actor(feat, training=False)
-            else:
-                a = self.actor(feat, training=False)
-
-            step = self.rssm_step(state, a, embed=None)
-            state = {
-                'h': step['h'],
-                'z': step['z'],
-                'z_probs': step['z_probs'],
-            }
-
-            feat_next = self.get_feat(state)
-            r = self.reward_head(feat_next).mean  # (B,)
-            c_dist = self.continue_head(feat_next)
-            c_logits = c_dist.logits if hasattr(c_dist, 'logits') else c_dist
-            c = torch.sigmoid(c_logits)  # (B,)
-            v = self.critic(feat_next).mean  # (B,)
-
-            feats.append(feat_next)
-            actions.append(a)
-            rewards.append(r)
-            continues.append(c)
-            values.append(v)
-
-        return {
-            'feat': torch.stack(feats, dim=1),
-            'actions': torch.stack(actions, dim=1),
-            'rewards': torch.stack(rewards, dim=1),
-            'continues': torch.stack(continues, dim=1),
-            'values': torch.stack(values, dim=1),
-        }
-
-    def lambda_returns(self, rewards, values, continues, gamma=0.99, lam=0.95):
-        """Compute Dreamer-style lambda returns.
-
-        Args:
-            rewards: (B,H)
-            values: (B,H) bootstrap values for each step
-            continues: (B,H) continuation probabilities in [0,1]
-
-        Returns:
-            returns: (B,H)
-        """
-        if rewards.shape != values.shape or rewards.shape != continues.shape:
-            raise ValueError("rewards/values/continues must have the same shape (B,H)")
-
-        B, H = rewards.shape
-        returns = torch.zeros_like(rewards)
-        next_return = values[:, -1]
-
-        for t in reversed(range(H)):
-            discount = gamma * continues[:, t]
-            # One-step target is r + discount * V_{t}
-            # Lambda return mixes bootstrapped target and the accumulated return.
-            bootstrap = values[:, t]
-            next_return = rewards[:, t] + discount * ((1 - lam) * bootstrap + lam * next_return)
-            returns[:, t] = next_return
-
-        return returns
-
-    def compute_actor_critic_loss(self, output, horizon=15, gamma=0.99, lam=0.95, entropy_coef=0.0):
-        """Compute actor/critic losses using imagination rollouts.
-
-        This assumes the world model is already trained / being trained by compute_loss.
-        We start imagination from the posterior state at the last observed time step.
-
-        Args:
-            output: dict from forward()
-            horizon: imagination horizon
-            gamma: discount
-            lam: lambda for returns
-            entropy_coef: optional entropy regularization (0 to disable)
-
-        Returns:
-            dict: {'actor_loss','critic_loss','imagine_returns_mean'}
-        """
-
-        # Start from last posterior state (B,)
-        h_last = output['h'][:, -1]
-        z_last = output['z'][:, -1]
-        z_probs_last = output.get('z_probs', None)
-        if z_probs_last is not None:
-            z_probs_last = z_probs_last[:, -1]
-
-        start_state = {
-            'h': h_last,
-            'z': z_last,
-            'z_probs': z_probs_last,
-        }
-
-        imag = self.imagine(start_state, horizon=horizon)
-
-        # Lambda returns for critic training
-        with torch.no_grad():
-            returns = self.lambda_returns(imag['rewards'], imag['values'], imag['continues'], gamma=gamma, lam=lam)
-
-        # Critic predicts value for imagined features
-        feat = imag['feat']  # (B,H,F)
-        B, H, feat_dim = feat.shape
-        value_pred = self.critic(feat.reshape(B * H, feat_dim)).mean.view(B, H)
-        critic_loss = F.mse_loss(value_pred, returns)
-
-        # Actor loss: maximize returns / value via features (simple Dreamer-style objective)
-        # We use predicted value as a surrogate; this is common and keeps gradients local.
-        actor_obj = value_pred
-
-        # Optional entropy regularization for exploration (not required for correctness)
-        if entropy_coef != 0.0:
-            # ActorNet doesn't expose distribution; keep entropy term disabled by default.
-            pass
-
-        actor_loss = -actor_obj.mean()
-
-        return {
-            'actor_loss': actor_loss,
-            'critic_loss': critic_loss,
-            'imagine_returns_mean': returns.mean().detach(),
-        }
     
     def compute_loss(self, output, normalized_images, rewards, dones, device):
         """
@@ -639,17 +459,26 @@ class DreamerV3(GRPBase):
         continue_loss = bce_fn(cont_logits_tensor, not_done).mean()
 
         # --- KL losses between posterior and prior categorical latents ---
-        prior_distribution = Independent(OneHotCategoricalStraightThrough(logits=priors_logits), 1)
+        # Use raw network logits directly — no softmax/probs_to_logits round-trip.
+        # The round-trip would introduce numerical error that makes the KL measure
+        # a different distribution from what was sampled, causing rep_loss to diverge.
+        prior_distribution    = Independent(OneHotCategoricalStraightThrough(logits=priors_logits), 1)
         prior_distribution_sg = Independent(OneHotCategoricalStraightThrough(logits=priors_logits.detach()), 1)
-        post_distribution = Independent(OneHotCategoricalStraightThrough(logits=posts_logits), 1)
-        post_distribution_sg = Independent(OneHotCategoricalStraightThrough(logits=posts_logits.detach()), 1)
-        
-        prior_loss = kl_divergence(post_distribution_sg, prior_distribution)
-        post_loss = kl_divergence(post_distribution, prior_distribution_sg)
-        free_nats_tensor = torch.full_like(prior_loss, free_nats)
+        post_distribution     = Independent(OneHotCategoricalStraightThrough(logits=posts_logits), 1)
+        post_distribution_sg  = Independent(OneHotCategoricalStraightThrough(logits=posts_logits.detach()), 1)
 
-        dyn_loss = torch.maximum(prior_loss, free_nats_tensor).mean()
-        rep_loss = torch.maximum(post_loss, free_nats_tensor).mean()
+        # dyn_loss: trains the prior  → KL(sg(post) ‖ prior)
+        # rep_loss: trains the posterior → KL(post ‖ sg(prior))
+        # Apply free_nats AFTER averaging so the floor is on the scalar loss,
+        # not per-element (per-element flooring permanently hides improvement).
+        dyn_loss = torch.maximum(
+            kl_divergence(post_distribution_sg, prior_distribution).mean(),
+            torch.tensor(free_nats, device=device)
+        )
+        rep_loss = torch.maximum(
+            kl_divergence(post_distribution, prior_distribution_sg).mean(),
+            torch.tensor(free_nats, device=device)
+        )
 
 
         pred_loss = recon_loss + reward_loss + continue_loss
@@ -663,22 +492,6 @@ class DreamerV3(GRPBase):
             'dyn_loss': dyn_loss,
             'rep_loss': rep_loss,
         }
-
-        # Optionally include actor/critic losses if enabled in cfg.
-        ac_cfg = getattr(self._cfg, 'actor_critic', None)
-        use_ac = bool(getattr(ac_cfg, 'enabled', False)) if ac_cfg is not None else False
-        if use_ac:
-            horizon = int(getattr(ac_cfg, 'horizon', 15))
-            gamma = float(getattr(ac_cfg, 'gamma', 0.99))
-            lam = float(getattr(ac_cfg, 'lambda_', 0.95))
-            actor_coef = float(getattr(ac_cfg, 'actor_coef', 1.0))
-            critic_coef = float(getattr(ac_cfg, 'critic_coef', 1.0))
-            ac_losses = self.compute_actor_critic_loss(output, horizon=horizon, gamma=gamma, lam=lam)
-
-            losses['actor_loss'] = ac_losses['actor_loss']
-            losses['critic_loss'] = ac_losses['critic_loss']
-            losses['imagine_returns_mean'] = ac_losses['imagine_returns_mean']
-            losses['total_loss'] = losses['total_loss'] + actor_coef * losses['actor_loss'] + critic_coef * losses['critic_loss']
 
         return losses
 

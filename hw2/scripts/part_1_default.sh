@@ -25,5 +25,5 @@ nohup python dreamer_model_trainer.py \
     exp_name=q1_simple_cem_H_15 \
     experiment.name=q1_simple_cem_H_15 \
     use_policy=false \
-    > logs/q1_simple_cem.log 2>&1 &
+    > logs/q1_simple_cem_H_15.log 2>&1 &
 # or use tmux/screen to run the command in a separate terminal session that can be detached and reattached later.
