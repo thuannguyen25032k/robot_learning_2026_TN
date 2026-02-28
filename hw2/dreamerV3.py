@@ -370,26 +370,23 @@ class DreamerV3(GRPBase):
             posts_logits.append(step_out['post_logits'])
             
             # features.append(feat_t)
+        # Stack temporal lists into tensors: (B, T, ...)
         recurrentStates = torch.stack(hs, dim=1)  # (B, T, deter_dim)
         posteriors = torch.stack(zs, dim=1)  # (B, T, stoch_dim*discrete_dim)
+        priors_stacked = torch.stack(priors_logits, dim=1)   # (B, T, stoch_dim, discrete_dim)
+        posts_stacked = torch.stack(posts_logits, dim=1)  # (B, T, stoch_dim, discrete_dim)
         # print(f"recurrentStates shape: {recurrentStates.shape}, posteriors shape: {posteriors.shape}")
         full_state = torch.cat((recurrentStates, posteriors), dim=-1)  # (B, T, deter_dim + stoch_dim*discrete_dim)
         # Heads
-        reconstructions_mean = self.decoder(full_state.view(B*T, -1)).view(B, T, *self.obs_shape)  # (B, T, C, H, W)
-        reconstruction_distribution = Independent(Normal(reconstructions_mean, 1.0), len(self.obs_shape))  # Assume fixed std for reconstruction loss
-        rewards_distribution = self.reward_head(full_state)
-        continues_logits = self.continue_head(full_state)
-
-        priors_stacked = torch.stack(priors_logits, dim=1)   # (B, T, stoch_dim, discrete_dim)
-        # Guard: posts_logits entries are None during pure imagination (embed=None).
-        # During training they are always set, but be defensive anyway.
-        posts_stacked = torch.stack(posts_logits, dim=1)  # (B, T, stoch_dim, discrete_dim)
+        reconstructions = self.decoder(full_state.view(B*T, -1)).view(B, T, *self.obs_shape)  # (B, T, C, H, W)
+        rewards_pred = self.reward_head(full_state.view(B*T, -1)).view(B, T)  # (B, T)
+        continues_logits = self.continue_head(full_state.view(B*T, -1)).view(B, T)  # (B, T)
 
         # Stack time dimension
         out = {
-            'reconstructions': reconstruction_distribution,         
-            'rewards': rewards_distribution,                
-            'continues': continues_logits,            
+            'reconstructions': reconstructions,         # (B, T, C, H, W)
+            'rewards': rewards_pred,                         # (B, T)
+            'continues': continues_logits,              # (B, T) (logits)
             'priors_logits': priors_stacked,            # (B, T, stoch_dim, discrete_dim)
             'posts_logits': posts_stacked,              # (B, T, stoch_dim, discrete_dim)
             'h': torch.stack(hs, dim=1),
@@ -440,9 +437,9 @@ class DreamerV3(GRPBase):
         # Optional KL free nats
         free_nats = 1.0
 
-        reconstruction_distribution = output['reconstructions']
-        pred_rewards = output['rewards']
-        cont_logits = output['continues']
+        reconstructions = output['reconstructions']
+        rewards_pred = output['rewards']
+        continues_pred = output['continues']
         priors_logits = output['priors_logits']
         posts_logits = output['posts_logits']
 
@@ -452,22 +449,17 @@ class DreamerV3(GRPBase):
             dones = dones.squeeze(-1)
 
         # --- Reconstruction loss (pixel MSE in normalized space) ---
-        
-        recon_loss = -reconstruction_distribution.log_prob(normalized_images).mean()
+        # Image Reconstruction Loss (MSE)
+        recon_loss = F.mse_loss(reconstructions, normalized_images)
 
         # --- Reward prediction loss ---
         # A simple, robust choice: MSE on raw rewards.
-        reward_loss = -pred_rewards.log_prob(rewards.squeeze(-1)).mean()
+        reward_loss = F.mse_loss(rewards_pred, rewards)
 
-        # --- Continue prediction loss ---
-        not_done = (1.0 - dones.float()).to(device)
-        # `output['continues']` is a Bernoulli distribution returned from ContinuePredictor.
-        # Use its logits and BCEWithLogitsLoss for numerical stability. Ensure shapes match (B, T).
-        B, T = normalized_images.shape[0], normalized_images.shape[1]
-        cont_logits_tensor = cont_logits.logits if hasattr(cont_logits, 'logits') else cont_logits
-        cont_logits_tensor = cont_logits_tensor.view(B, T)
-        bce_fn = nn.BCEWithLogitsLoss(reduction='none')
-        continue_loss = bce_fn(cont_logits_tensor, not_done).mean()
+        # Continue Predictor Loss (Binary Cross Entropy)
+        # Model predicts whether the episode continues (1) or is done (0)
+        continues_target = 1.0 - dones.float().squeeze(-1)
+        continue_loss = F.binary_cross_entropy_with_logits(continues_pred, continues_target)
 
         # --- KL losses between posterior and prior categorical latents ---
         # Use raw network logits directly — no softmax/probs_to_logits round-trip.

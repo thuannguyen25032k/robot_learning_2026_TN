@@ -141,12 +141,11 @@ class RewardPredictor(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 2)
+            nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, x):
-        mean, logStd = self.net(x).chunk(2, dim=-1)
-        return Normal(mean.squeeze(-1), torch.exp(logStd).squeeze(-1))
+        return self.net(x).squeeze(-1)
 
 class ContinuePredictor(nn.Module):
     def __init__(self, input_dim, hidden_dim):
@@ -159,7 +158,7 @@ class ContinuePredictor(nn.Module):
 
     def forward(self, x):
         logits = self.net(x).squeeze(-1)
-        return Bernoulli(logits=logits)
+        return logits
 
 class ActorNet(nn.Module):
     """Simple Gaussian actor head for Dreamer.
