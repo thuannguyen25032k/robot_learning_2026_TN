@@ -179,7 +179,7 @@ class CEMPlanner(Planner):
                     'z_probs': step_out.get('z_probs', None),
                 }
             full_feat = torch.stack(full_feat, dim=1)  # (K, H, feat_dim)
-            r_t = self.world_model.reward_head(full_feat).sample()  # (K, H) because reward_head outputs normal distribution parameters and we take the mean as the predicted reward at each step
+            r_t = self.world_model.reward_head(full_feat.view(self.K* self.horizon, -1)).view(self.K, self.horizon)  # (K, H) because reward_head outputs normal distribution parameters and we take the mean as the predicted reward at each step
             total_rewards = r_t.sum(dim=-1)  # Sum rewards over the horizon to get total reward for each sequence (K,)
         return total_rewards
     
@@ -544,7 +544,11 @@ class PolicyPlanner(GRPBase):
                 "DreamerV3 planning requires initial_state with keys {'h','z'} (and optionally 'z_probs')."
             )
 
-        state = initial_state
+        state = {
+            'h': initial_state['h'].repeat(self.K, 1).to(self.device),  # (K, deter_dim)
+            'z': initial_state['z'].repeat(self.K, 1).to(self.device),  # (K, stoch_dim)
+            'z_probs': initial_state.get('z_probs', None)
+            }
 
         self.world_model.eval()
         full_feat = []
@@ -564,7 +568,7 @@ class PolicyPlanner(GRPBase):
                     'z_probs': step_out.get('z_probs', None),
                 }
             full_feat = torch.stack(full_feat, dim=1)  # (K, H, feat_dim)
-            r_t = self.world_model.reward_head(full_feat).sample()  # (K, H) because reward_head outputs normal distribution parameters and we take the mean as the predicted reward at each step
+            r_t = self.world_model.reward_head(full_feat.view(self.K* self.horizon, -1)).view(self.K, self.horizon)  # (K, H) because reward_head outputs normal distribution parameters and we take the mean as the predicted reward at each step
             total_rewards = r_t.sum(dim=-1)  # Sum rewards over the horizon to get total reward for each sequence (K,)
         return total_rewards
 

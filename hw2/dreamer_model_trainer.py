@@ -81,33 +81,33 @@ def batch_data(dataset, batch_size, cfg):
     # Collect sequences for the batch with fixed sequence length
     list_images, list_actions, list_rewards, list_dones, list_poses = [], [], [], [], []
     # padding short trajectories to max_seq_len with zeros
-    # for img, act, rew, don, pos in dataset:
-    #     images += [img[i:i+cfg.policy.sequence_length] for i in range(0, len(img)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
-    #     actions += [act[i:i+cfg.policy.sequence_length] for i in range(0, len(act)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
-    #     rewards += [rew[i:i+cfg.policy.sequence_length] for i in range(0, len(rew)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
-    #     dones += [don[i:i+cfg.policy.sequence_length] for i in range(0, len(don)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
-    #     poses += [pos[i:i+cfg.policy.sequence_length] for i in range(0, len(pos)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
-    # images = torch.stack(images)  # (B, T, H, W, C)
-    # actions = torch.stack(actions)  # (B, T, action_dim)
-    # rewards = torch.stack(rewards)  # (B, T)
-    # dones = torch.stack(dones)  # (B, T)
-    # poses = torch.stack(poses)  # (B, T, pose_dim)
-    # images = images.permute(0, 1, 4, 2, 3).to(cfg.device)  # (B, T, H, W, C) -> (B, T, C, H, W)
-    # actions = actions.float().to(cfg.device) # (B, T, action_dim)
-    # rewards = rewards.float().to(cfg.device) # (B, T)
-    # dones = dones.float().to(cfg.device) # (B, T)
-    # poses = poses.float().to(cfg.device) # (B, T, pose_dim)
     for img, act, rew, don, pos in dataset:
-        list_images.append(img)  # (T, H, W, C)
-        list_actions.append(act)  # (T, action_dim)
-        list_rewards.append(rew)  # (T,)
-        list_dones.append(don)  # (T,)
-        list_poses.append(pos)  # (T, pose_dim)
-    images = pad_sequence(list_images, batch_first=True, padding_value=0.0).permute(0, 1, 4, 2, 3).to(cfg.device)  # (B, T, H, W, C) -> (B, T, C, H, W)
-    actions = pad_sequence(list_actions, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T, action_dim)
-    rewards = pad_sequence(list_rewards, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T)
-    dones = pad_sequence(list_dones, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T)
-    poses = pad_sequence(list_poses, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T, pose_dim)
+        list_images += [img[i:i+cfg.policy.sequence_length] for i in range(0, len(img)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+        list_actions += [act[i:i+cfg.policy.sequence_length] for i in range(0, len(act)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+        list_rewards += [rew[i:i+cfg.policy.sequence_length] for i in range(0, len(rew)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+        list_dones += [don[i:i+cfg.policy.sequence_length] for i in range(0, len(don)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+        list_poses += [pos[i:i+cfg.policy.sequence_length] for i in range(0, len(pos)-cfg.policy.sequence_length+1, cfg.policy.sequence_length)]
+    images = torch.stack(list_images)  # (B, T, H, W, C)
+    actions = torch.stack(list_actions)  # (B, T, action_dim)
+    rewards = torch.stack(list_rewards)  # (B, T)
+    dones = torch.stack(list_dones)  # (B, T)
+    poses = torch.stack(list_poses)  # (B, T, pose_dim)
+    images = images.permute(0, 1, 4, 2, 3).to(cfg.device)  # (B, T, H, W, C) -> (B, T, C, H, W)
+    actions = actions.float().to(cfg.device) # (B, T, action_dim)
+    rewards = rewards.float().to(cfg.device) # (B, T)
+    dones = dones.float().to(cfg.device) # (B, T)
+    poses = poses.float().to(cfg.device) # (B, T, pose_dim)
+    # for img, act, rew, don, pos in dataset:
+    #     list_images.append(img)  # (T, H, W, C)
+    #     list_actions.append(act)  # (T, action_dim)
+    #     list_rewards.append(rew)  # (T,)
+    #     list_dones.append(don)  # (T,)
+    #     list_poses.append(pos)  # (T, pose_dim)
+    # images = pad_sequence(list_images, batch_first=True, padding_value=0.0).permute(0, 1, 4, 2, 3).to(cfg.device)  # (B, T, H, W, C) -> (B, T, C, H, W)
+    # actions = pad_sequence(list_actions, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T, action_dim)
+    # rewards = pad_sequence(list_rewards, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T)
+    # dones = pad_sequence(list_dones, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T)
+    # poses = pad_sequence(list_poses, batch_first=True, padding_value=0.0).float().to(cfg.device)  # (B, T, pose_dim)
     print(f"[info] Batched data into tensors with shapes: images={images.shape}, actions={actions.shape}, rewards={rewards.shape}, dones={dones.shape}, poses={poses.shape}")
     out_dataset = torch.utils.data.TensorDataset(images, actions, rewards, dones, poses)
     print(f"[info] Created DataLoader with {len(out_dataset)} samples")
@@ -497,7 +497,7 @@ def my_main(cfg: DictConfig):
         policy = PolicyNet(
             in_dim=policy_in_dim,
             action_dim=7,
-            hidden_dim=512,
+            hidden_dim=256,
             n_layers=2,
             dropout=cfg.dropout,
         )
@@ -540,8 +540,7 @@ def my_main(cfg: DictConfig):
     batch_size = 32
     cfg.policy.sequence_length = 16
     # Define optimizer and loss function
-    # lr=1e-4 is safer for DreamerV3: lr=1e-3 causes logit explosion → dyn_loss → inf after ~1000 steps
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
     # Add linear learning rate scheduler that decays to 0 over training
     scheduler = torch.optim.lr_scheduler.LinearLR(
