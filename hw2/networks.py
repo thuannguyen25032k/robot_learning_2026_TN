@@ -109,6 +109,8 @@ class PriorNet(nn.Module):
         """
         raw_logits = self.net(x)  # (B, latent_dim * latent_classes)
         logits = raw_logits.view(-1, self.latent_dim, self.latent_classes)  # (B, Z, C)
+        # Clamp logits to prevent extreme values that make KL(post||prior) → inf.
+        # Without clamping, after ~1000 steps unbounded logits cause dyn_loss to explode.
         return logits
 
 class PosteriorNet(nn.Module):
@@ -130,6 +132,7 @@ class PosteriorNet(nn.Module):
         """
         raw_logits = self.net(x)  # (B, latent_dim * latent_classes)
         logits = raw_logits.view(-1, self.latent_dim, self.latent_classes)  # (B, Z, C)
+        # Clamp logits to keep KL finite. Matches the clamp in PriorNet.
         return logits
 
 class RewardPredictor(nn.Module):

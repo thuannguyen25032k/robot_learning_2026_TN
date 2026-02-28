@@ -17,10 +17,10 @@ loss_coeffs:
 planner:
   type: cem  # Default planner type
   horizon: 12
-  num_iterations: 3
-  num_samples: 100
+  num_iterations: 5
+  num_samples: 200
   num_elites: 20
-  temperature: 0.3
+  temperature: 0.5
   learning_rate: 0.001
 
 experiment:
@@ -37,14 +37,14 @@ exp_name: "default_exp"
 
 # Model type: "transformer" or "convnet" or "dataset" or "dense"
 model: 
-  type: "dataset"
+  type: "transformer"
 
 batch_size: 32 # how many independent sequences will we process in parallel?
 max_block_size: 16 ## Tokens for langauge processing
 vocab_size: 32 ## Will be overidden by code
 n_patches: 8
 patch_size: 8
-max_iters: 2500
+max_iters: 5000
 eval_interval: 100 # How often to run eval over the validation set
 learning_rate: 3e-4
 lr_schedule: linear ## ['inverse_sqrt', 'linear']
@@ -69,7 +69,7 @@ simEval: ["libero"]
 sim:
   eval_episodes: 1
   eval_tasks: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # List of task indices to evaluate on; length should match eval_episodes
-  episode_length: 200
+  episode_length: 300
   task_set: "libero_spatial"
   libero_init_state_file: "/openvla/experiments/robot/libero/libero_spatial_init_states_and_goals.hdf"
   libero_init_state_hf_repo: "gberseth/libero_spatial_init_states"

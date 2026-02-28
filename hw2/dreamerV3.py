@@ -105,6 +105,9 @@ class GRPBase(nn.Module):
         """Preprocess observation image"""
         img = self.resize_image(image)
         img = self.normalize_state(img)
+        ## Change numpy array from channel-last to channel-first
+        img = np.transpose(img, (2, 0, 1))  # (H, W, C) -> (C, H, W)
+        # img = img.permute(2, 0, 1)  # (H, W, C) -> (C, H, W)
         return img
 
     def preprocess_goal_image(self, image):
@@ -235,19 +238,28 @@ class DreamerV3(GRPBase):
         # That conversion introduces numerical error that accumulates across time steps
         # and makes the KL (rep_loss / dyn_loss) measure a slightly different distribution
         # from what was actually sampled, causing rep_loss to diverge.
+
+        # Unimix smoothing (DreamerV3 paper §A): blend categorical probs with uniform
+        # to ensure no class has p=0, which would make KL = inf.
+        unimix = 0.01
+        probs = torch.softmax(logits, dim=-1)
+        uniform = torch.ones_like(probs) / self.discrete_dim
+        probs = (1.0 - unimix) * probs + unimix * uniform
+        # Convert smoothed probs back to logits for sampling
+        smooth_logits = probs_to_logits(probs)
+
         if training:
             # Straight-through one-hot categorical sampling so gradients can flow.
-            z = Independent(OneHotCategoricalStraightThrough(logits=logits), 1).rsample()  # (B, stoch_dim, discrete_dim)
+            z = Independent(OneHotCategoricalStraightThrough(logits=smooth_logits), 1).rsample()  # (B, stoch_dim, discrete_dim)
         else:
             # Deterministic mode for evaluation/planning.
-            idx = torch.argmax(logits, dim=-1)  # (B, stoch_dim)
+            idx = torch.argmax(smooth_logits, dim=-1)  # (B, stoch_dim)
             z = torch.nn.functional.one_hot(idx, num_classes=self.discrete_dim).to(logits.dtype)
 
         # Flatten to match the rest of the model which expects (B, stoch_dim * discrete_dim)
         z_flat = z.view(z.shape[0], self.stoch_dim * self.discrete_dim)
         # Return probs for state bookkeeping (z_probs is only used for get_initial_state / logging).
-        probs = torch.softmax(logits, dim=-1)
-        return z_flat, probs
+        return z_flat, probs, smooth_logits
 
     def rssm_step(self, prev_state, action, embed=None):
         # TODO: Part 3.1 - Implement RSSM step
@@ -267,7 +279,7 @@ class DreamerV3(GRPBase):
 
         # 2) Prior over stochastic state from new deterministic state
         prior_logits = self.prior_net(h)  # (B, stoch_dim, discrete_dim): the prior distribution over the stochastic state based on the new deterministic state
-
+        z, z_probs, smooth_prior_logits = self.sample_stochastic(prior_logits, training=self.training)    # Sample from the prior during imagination/rollout, and use argmax during evaluation
         # 3) If we have an observation embedding, compute posterior and sample from it.
         if embed is not None:
             # Posterior conditions on [h, embed]
@@ -275,22 +287,21 @@ class DreamerV3(GRPBase):
                 embed = embed[:, 0]
             post_in = torch.cat([h, embed], dim=-1) # (B, deter_dim + hidden_dim): combine deterministic state and observation embedding for posterior computation
             post_logits = self.post_net(post_in)  # (B, stoch_dim, discrete_dim): the posterior distribution over the stochastic state based on the new deterministic state and the current observation embedding
-            z, z_probs = self.sample_stochastic(post_logits, training=self.training)    # Sample from the posterior during training, and use argmax during evaluation
+            z, z_probs, smooth_post_logits = self.sample_stochastic(post_logits, training=self.training)    # Sample from the posterior during training, and use argmax during evaluation
             return {
                 'h': h,
                 'z': z,
                 'z_probs': z_probs,
-                'prior_logits': prior_logits,
-                'post_logits': post_logits,
+                'prior_logits': smooth_prior_logits,
+                'post_logits': smooth_post_logits,
             }
 
         # 4) Otherwise, sample from the prior (imagination / rollout)
-        z, z_probs = self.sample_stochastic(prior_logits, training=self.training)
         return {
             'h': h,
             'z': z,
             'z_probs': z_probs,
-            'prior_logits': prior_logits,
+            'prior_logits': smooth_prior_logits,  # Return the smoothed prior logits for KL computation in compute_loss
             'post_logits': None,
         }
 

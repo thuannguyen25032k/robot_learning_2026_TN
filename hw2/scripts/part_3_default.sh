@@ -15,7 +15,7 @@ nohup python dreamer_model_trainer.py \
     model_type=dreamer \
     planner.type=cem \
     planner.horizon=15 \
-    planner.num_samples=100 \
+    planner.num_samples=200 \
     training.num_epochs=100 \
     exp_name=q3_dreamer_cem_H_15 \
     experiment.name=q3_dreamer_cem_H_15 \

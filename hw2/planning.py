@@ -155,55 +155,32 @@ class CEMPlanner(Planner):
                 "DreamerV3 planning requires initial_state with keys {'h','z'} (and optionally 'z_probs')."
             )
 
-        # action_sequences: (K, H, A)
-        K, H, A = action_sequences.shape
-        if H != self.horizon:
-            raise ValueError(f"Expected action_sequences horizon {self.horizon}, got {H}")
-        if A != self.action_dim:
-            raise ValueError(f"Expected action_dim {self.action_dim}, got {A}")
-
-        wm = self.world_model
-        device = action_sequences.device
-
-        # Expand initial RSSM state across K candidate sequences.
-        h0 = initial_state['h']
-        z0 = initial_state['z']
-        if h0.dim() == 2 and h0.shape[0] == 1:
-            h0 = h0.expand(K, -1)
-        if z0.dim() == 2 and z0.shape[0] == 1:
-            z0 = z0.expand(K, -1)
-        if h0.shape[0] != K:
-            raise ValueError(f"initial_state['h'] batch must be 1 or K={K}, got {h0.shape[0]}")
-        if z0.shape[0] != K:
-            raise ValueError(f"initial_state['z'] batch must be 1 or K={K}, got {z0.shape[0]}")
-
         state = {
-            'h': h0.to(device),
-            'z': z0.to(device),
-            # Not strictly needed for imagination; kept for completeness.
-            'z_probs': initial_state.get('z_probs', None),
-        }
+            'h': initial_state['h'].repeat(self.K, 1).to(self.device),  # (K, deter_dim)
+            'z': initial_state['z'].repeat(self.K, 1).to(self.device),  # (K, stoch_dim)
+            'z_probs': initial_state.get('z_probs', None)
+            }
 
-        total_rewards = torch.zeros(K, device=device)
-        wm.eval()
+        self.world_model.eval()
+        full_feat = []
         with torch.no_grad():
             for t in range(self.horizon):
                 a_t = action_sequences[:, t, :]
                 # RSSM imagination step: no embed -> sample from prior.
-                step_out = wm.rssm_step(state, a_t, embed=None)
+                step_out = self.world_model.rssm_step(state, a_t, embed=None)
                 h = step_out['h']
                 z = step_out['z']
 
                 feat = torch.cat([h, z], dim=-1)
-                r_t = wm.reward_head(feat).mean  # (K,)
-                total_rewards += r_t
-
+                full_feat.append(feat)
                 state = {
                     'h': h,
                     'z': z,
                     'z_probs': step_out.get('z_probs', None),
                 }
-
+            full_feat = torch.stack(full_feat, dim=1)  # (K, H, feat_dim)
+            r_t = self.world_model.reward_head(full_feat).sample()  # (K, H) because reward_head outputs normal distribution parameters and we take the mean as the predicted reward at each step
+            total_rewards = r_t.sum(dim=-1)  # Sum rewards over the horizon to get total reward for each sequence (K,)
         return total_rewards
     
     def _evaluate_sequences_simple(self, initial_state, action_sequences):
@@ -273,25 +250,25 @@ class CEMPlanner(Planner):
             raise ValueError(f"prev_actions must have shape (B,T,A); got {tuple(prev_actions.shape)}")
 
         B, T, C, H, W = observations.shape
-        device = observations.device
 
         # Build current RSSM state from the provided history.
         if prev_state is None:
-            state = self.world_model.get_initial_state(B, device=device)
+            # print("No previous state provided; initializing new RSSM state.")
+            state = self.world_model.get_initial_state(B, device=self.device)
         else:
             state = prev_state
-
-        wm = self.world_model
-        wm.eval()
+            
+        self.world_model.eval()
         with torch.no_grad():
-            obs_flat = observations.reshape(B * T, C, H, W)
-            embed_flat = wm.encoder(obs_flat)
+            # print(f"Input observations shape: {observations.shape}")
+            obs_flat = observations.view(B * T, C, H, W)
+            embed_flat = self.world_model.encoder(obs_flat)
             embed = embed_flat.view(B, T, -1)
 
             for t in range(T):
                 a_t = prev_actions[:, t, :]
                 e_t = embed[:, t, :]
-                step_out = wm.rssm_step(state, a_t, embed=e_t)
+                step_out = self.world_model.rssm_step(state, a_t, embed=e_t)
                 state = {
                     'h': step_out['h'],
                     'z': step_out['z'],
@@ -324,38 +301,6 @@ class CEMPlanner(Planner):
             'predicted_reward': best_reward,
             'final_state': initial_state  # Return the initial state used for planning (could also return the final state after rollout if desired)
         }
-
-        # [Imagine method remains mostly the same, ensuring valid input shapes for heads]
-    def preprocess_state(self, image):
-        """Preprocess observation image"""
-        # TODO: Preprocess image for input
-        ## Resize, normalize, and convert to channel-first format
-        # Reuse GRPBase utilities: resize_image() + normalize_state().
-        # GRPBase assumes channel-last (H,W,C), after which we convert to
-        # channel-first (C,H,W) for the Dreamer encoder.
-
-        # Accept torch tensors or numpy/PIL-style arrays.
-        if torch.is_tensor(image):
-            img = image.detach().cpu().numpy()
-        else:
-            img = np.array(image)
-
-        # If a batch/time dimension is present, keep only the last frame.
-        # Expected single frame shape is (H,W,C) or (C,H,W).
-        if img.ndim == 4:
-            img = img[-1]
-
-        # Convert channel-first to channel-last if needed.
-        if img.ndim == 3 and img.shape[0] in (1, 3) and img.shape[-1] not in (1, 3):
-            img = np.transpose(img, (1, 2, 0))
-
-        # Use inherited helpers (no recursion!).
-        img = self.resize_image(img)
-        img = self.normalize_state(img)
-
-        # (H,W,C) -> (C,H,W)
-        img = np.transpose(img, (2, 0, 1)).astype(np.float32)
-        return img
 
 
 class PolicyPlanner(GRPBase):
@@ -599,47 +544,28 @@ class PolicyPlanner(GRPBase):
                 "DreamerV3 planning requires initial_state with keys {'h','z'} (and optionally 'z_probs')."
             )
 
-        # action_sequences: (K, H, A)
-        K, H, A = action_sequences.shape
-        if H != self.horizon:
-            raise ValueError(f"Expected action_sequences horizon {self.horizon}, got {H}")
-        if A != self.action_dim:
-            raise ValueError(f"Expected action_dim {self.action_dim}, got {A}")
+        state = initial_state
 
-        wm = self.world_model
-        device = action_sequences.device
-
-        # Expand initial RSSM state across K candidate sequences.
-        h0 = initial_state['h']
-        z0 = initial_state['z']
-        if h0.dim() == 2 and h0.shape[0] == 1:
-            h0 = h0.expand(K, -1)
-        if z0.dim() == 2 and z0.shape[0] == 1:
-            z0 = z0.expand(K, -1)
-        if h0.shape[0] != K:
-            raise ValueError(f"initial_state['h'] batch must be 1 or K={K}, got {h0.shape[0]}")
-        if z0.shape[0] != K:
-            raise ValueError(f"initial_state['z'] batch must be 1 or K={K}, got {z0.shape[0]}")
-
-        state = {
-            'h': h0.to(device),
-            'z': z0.to(device),
-            'z_probs': initial_state.get('z_probs', None),
-        }
-
-        total_rewards = torch.zeros(K, device=device)
-        wm.eval()
+        self.world_model.eval()
+        full_feat = []
         with torch.no_grad():
             for t in range(self.horizon):
                 a_t = action_sequences[:, t, :]
-                step_out = wm.rssm_step(state, a_t, embed=None)  # imagination step
+                # RSSM imagination step: no embed -> sample from prior.
+                step_out = self.world_model.rssm_step(state, a_t, embed=None)
                 h = step_out['h']
                 z = step_out['z']
-                feat = torch.cat([h, z], dim=-1)
-                r_t = wm.reward_head(feat).mean
-                total_rewards += r_t
-                state = {'h': h, 'z': z, 'z_probs': step_out.get('z_probs', None)}
 
+                feat = torch.cat([h, z], dim=-1)
+                full_feat.append(feat)
+                state = {
+                    'h': h,
+                    'z': z,
+                    'z_probs': step_out.get('z_probs', None),
+                }
+            full_feat = torch.stack(full_feat, dim=1)  # (K, H, feat_dim)
+            r_t = self.world_model.reward_head(full_feat).sample()  # (K, H) because reward_head outputs normal distribution parameters and we take the mean as the predicted reward at each step
+            total_rewards = r_t.sum(dim=-1)  # Sum rewards over the horizon to get total reward for each sequence (K,)
         return total_rewards
 
     def _evaluate_sequences_simple(self, initial_state, action_sequences):
@@ -715,45 +641,46 @@ class PolicyPlanner(GRPBase):
         # TODO: Part 4.2 - Implement DreamerV3 forward pass for policy
         ## Encode observations, roll through RSSM, and plan with policy from current state
         if observations is None:
-            raise ValueError("Dreamer policy planning requires observations (B,T,C,H,W)")
+            raise ValueError("Dreamer planning requires observations (B,T,C,H,W)")
         if prev_actions is None:
-            raise ValueError("Dreamer policy planning requires prev_actions (B,T,A)")
+            raise ValueError("Dreamer planning requires prev_actions (B,T,A)")
+
         if observations.dim() != 5:
             raise ValueError(f"observations must have shape (B,T,C,H,W); got {tuple(observations.shape)}")
         if prev_actions.dim() != 3:
             raise ValueError(f"prev_actions must have shape (B,T,A); got {tuple(prev_actions.shape)}")
 
         B, T, C, H, W = observations.shape
-        device = observations.device
 
-        wm = self.world_model
-
-        # Build current RSSM state from history using posterior updates.
+        # Build current RSSM state from the provided history.
         if prev_state is None:
-            state = wm.get_initial_state(B, device=device)
+            print("No previous state provided; initializing new RSSM state.")
+            state = self.world_model.get_initial_state(B, device=self.device)
         else:
             state = prev_state
-
-        wm.eval()
+            
+        self.world_model.eval()
         with torch.no_grad():
-            obs_flat = observations.reshape(B * T, C, H, W)
-            embed_flat = wm.encoder(obs_flat)
+            obs_flat = observations.view(B * T, C, H, W)
+            embed_flat = self.world_model.encoder(obs_flat)
             embed = embed_flat.view(B, T, -1)
 
             for t in range(T):
                 a_t = prev_actions[:, t, :]
                 e_t = embed[:, t, :]
-                step_out = wm.rssm_step(state, a_t, embed=e_t)
+                step_out = self.world_model.rssm_step(state, a_t, embed=e_t)
                 state = {
                     'h': step_out['h'],
                     'z': step_out['z'],
                     'z_probs': step_out.get('z_probs', None),
                 }
 
-        # Now plan from the latent state using the policy-guided CEM in `plan()`.
         best_actions_seq, best_reward = self.plan(state)
+        if return_full_sequence:
+            planned = best_actions_seq
+        else:
+            planned = best_actions_seq[0]
 
-        planned = best_actions_seq if return_full_sequence else best_actions_seq[0]
         return {
             'actions': planned,
             'predicted_reward': best_reward,

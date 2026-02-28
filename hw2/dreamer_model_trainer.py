@@ -540,7 +540,8 @@ def my_main(cfg: DictConfig):
     batch_size = 32
     cfg.policy.sequence_length = 16
     # Define optimizer and loss function
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    # lr=1e-4 is safer for DreamerV3: lr=1e-3 causes logit explosion → dyn_loss → inf after ~1000 steps
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
     # Add linear learning rate scheduler that decays to 0 over training
     scheduler = torch.optim.lr_scheduler.LinearLR(
@@ -611,8 +612,9 @@ def my_main(cfg: DictConfig):
                 raise ValueError(f"Unknown model type: {model_type}")
             optimizer.zero_grad()
             batch_loss.backward()
-            # Clip gradients to prevent large updates from destabilising training
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=100.0)
+            # Clip gradients — essential for DreamerV3: without this, prior/posterior logits
+            # grow unbounded and dyn_loss / rep_loss → inf after ~1000 steps.
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=100.0)
             optimizer.step()
             loss = batch_loss.item()
             batch_counter += 1
