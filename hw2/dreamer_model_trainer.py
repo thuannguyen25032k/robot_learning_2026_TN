@@ -494,13 +494,7 @@ def my_main(cfg: DictConfig):
 
         # Stochastic policy: outputs [mean (Tanh-bounded), log_std] concatenated → shape (B, 14).
         # _PolicyNet: deep residual MLP with pre-norm blocks and separate mean/log-std heads.
-        policy = PolicyNet(
-            in_dim=policy_in_dim,
-            action_dim=7,
-            hidden_dim=512,
-            n_layers=2,
-            dropout=cfg.dropout,
-        )
+        policy = PolicyNet(in_dim=policy_in_dim, action_dim=7, hidden_dim=256, n_layers=2, dropout=cfg.policy.dropout)
         policy.to(device)
         planner = PolicyPlanner(
             model,
@@ -510,8 +504,8 @@ def my_main(cfg: DictConfig):
         )
         if cfg.planner.type == 'policy_guided_cem':
             # Load pretrained policy model for policy-guided CEM
+            print(f"[info] Loading pretrained policy model from {cfg.load_policy}")
             planner.load_policy_model(cfg.load_policy)
-            planner.load_world_model(cfg.load_world_model)
     else:
         planner = CEMPlanner(
             model,
@@ -537,8 +531,11 @@ def my_main(cfg: DictConfig):
                 cfg.dataset, 'data_dir', '/network/projects/real-g-grp/libero/targets_clean/')
             dataset = LIBERODataset(data_dir, transform=transforms.ToTensor())
 
-    batch_size = 32
-    cfg.policy.sequence_length = 16
+    load_world_model = getattr(cfg, 'load_world_model', None)
+    if load_world_model is not None:
+        planner.load_world_model(load_world_model)
+        print(f"[info] Loaded world model weights from {load_world_model}")
+
     # Define optimizer and loss function
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -562,7 +559,7 @@ def my_main(cfg: DictConfig):
         if epoch == 0 or ((epoch-1) % cfg.eval_vid_iters == 0):
             print(f"[info] Starting epoch {epoch+1}/{cfg.max_iters} with {len(dataset)} trajectories in dataset")
             # Batch data using the batch_data utility function
-            dataloader = batch_data(dataset, batch_size=batch_size, cfg=cfg)
+            dataloader = batch_data(dataset, batch_size=cfg.batch_size, cfg=cfg)
 
         # Process data in batches
         for batch in dataloader:
@@ -577,7 +574,6 @@ def my_main(cfg: DictConfig):
             ## Call model_wrapper.forward_pass() with appropriate inputs based on model type
             if model_type == 'dreamer':
                 if (cfg.use_policy and (cfg.planner.type == 'policy' or cfg.planner.type == 'policy_guided_cem')):  
-                    policy.train()  # Set policy to training mode
                     policy_loss = planner.update(normalized_poses, normalized_actions)
                 model_out = model_wrapper.forward_pass(normalized_images, None, normalized_actions)
                 loss_dict = model_wrapper.compute_loss(
@@ -591,7 +587,6 @@ def my_main(cfg: DictConfig):
                 batch_loss = loss_dict['total_loss']
             elif model_type == 'simple':
                 if (cfg.use_policy and (cfg.planner.type == 'policy' or cfg.planner.type == 'policy_guided_cem')):  
-                    policy.train()  # Set policy to training mode
                     policy_loss = planner.update(normalized_poses, normalized_actions)
                 model_out = model_wrapper.forward_pass(
                     None,
@@ -612,8 +607,7 @@ def my_main(cfg: DictConfig):
             optimizer.zero_grad()
             batch_loss.backward()
             # Clip gradients — essential for DreamerV3: without this, prior/posterior logits
-            # grow unbounded and dyn_loss / rep_loss → inf after ~1000 steps.
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=100.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             loss = batch_loss.item()
             batch_counter += 1
@@ -621,14 +615,14 @@ def my_main(cfg: DictConfig):
             if loss_dict is not None:
                 # Dreamer: log the components for quick debugging.
                 print(
-                    f"Epoch [{epoch+1}/{cfg.max_iters }], Batch [{batch_counter}/{(len(dataset) + batch_size - 1) // batch_size}], "
+                    f"Epoch [{epoch+1}/{cfg.max_iters }], Batch [{batch_counter}/{(len(dataset) + cfg.batch_size - 1) // cfg.batch_size}], "
                     f"Loss: {batch_loss.item():.4f}, recon: {loss_dict['recon_loss'].item():.4f}, "
                     f"reward: {loss_dict['reward_loss'].item():.4f}, cont: {loss_dict['continue_loss'].item():.4f}, "
                     f"dyn: {loss_dict['dyn_loss'].item():.4f}, rep: {loss_dict['rep_loss'].item():.4f}, policy_loss: {policy_loss:.4f}"
                 )
             else:
                 print(
-                    f"Epoch [{epoch+1}/{cfg.max_iters }], Batch [{batch_counter}/{(len(dataset) + batch_size - 1) // batch_size}], "
+                    f"Epoch [{epoch+1}/{cfg.max_iters }], Batch [{batch_counter}/{(len(dataset) + cfg.batch_size - 1) // cfg.batch_size}], "
                     f"Loss: {batch_loss.item():.4f}, policy_loss: {policy_loss:.4f}"
                 )
 

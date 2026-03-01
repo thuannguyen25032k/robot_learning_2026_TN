@@ -17,10 +17,10 @@ loss_coeffs:
 planner:
   type: cem  # Default planner type
   horizon: 12
-  num_iterations: 5
-  num_samples: 200
-  num_elites: 20
-  temperature: 0.5
+  num_iterations: 100
+  num_samples: 100
+  num_elites: 10
+  temperature: 0.3
   learning_rate: 0.001
 
 experiment:
@@ -39,7 +39,7 @@ exp_name: "default_exp"
 model: 
   type: "transformer"
 
-batch_size: 32 # how many independent sequences will we process in parallel?
+batch_size: 64 # how many independent sequences will we process in parallel?
 max_block_size: 16 ## Tokens for langauge processing
 vocab_size: 32 ## Will be overidden by code
 n_patches: 8
@@ -60,6 +60,7 @@ policy:
   add_noise_to_state: true  # New flag to indicate whether to add noise to state
   state_noise_std: 0.01  # Standard deviation of the noise to be added
   sequence_length: 8
+  dropout: 0.2
 
 testing: false
 eval_vid_iters: 50
@@ -68,7 +69,7 @@ gradient_accumulation_steps: 1
 simEval: ["libero"]
 sim:
   eval_episodes: 1
-  eval_tasks: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # List of task indices to evaluate on; length should match eval_episodes
+  eval_tasks: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] # List of task indices to evaluate on; length should match eval_episodes
   episode_length: 300
   task_set: "libero_spatial"
   libero_init_state_file: "/openvla/experiments/robot/libero/libero_spatial_init_states_and_goals.hdf"
@@ -81,7 +82,6 @@ device: "cuda"
 n_embd: 512
 n_head: 16
 n_blocks: 4
-dropout: 0.2
 action_dim: 7
 load_action_bounds: true
 

@@ -136,7 +136,8 @@ def eval_model_in_sim(cfg, model, device, log_dir, env, env_unwrapped,
 
     if not cfg.testing:
         try:
-            wandb.log({"example": wandb.Video(path_)})
+            # Explicit format to avoid W&B warning (defaulting to gif will be removed in v0.20.0)
+            wandb.log({"example": wandb.Video(path_, format="mp4")})
         except Exception as e:
             print(f"Warning: failed to log video to wandb: {e}")
 
@@ -214,6 +215,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
     trajectory_data = []
     # retrieve a specific task
     tasks = cfg.sim.eval_tasks
+    success_count = 0
     for idx, task_id in enumerate(tasks):
         task = task_suite.get_task(task_id)
         task_name = task.name
@@ -364,6 +366,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
                         break
                 if done:
                     print("Episode finished with success after {} timesteps".format(step_))
+                    success_count += 1
                     break
             trajectory_data.append({
                 'task_id': task_id,
@@ -388,9 +391,9 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
     episode_stats['traj'] = trajectory_data
     print(f"avg reward {np.mean([np.mean(traj['rewards']) for traj in trajectory_data]):.8f}")
     if not cfg.testing:
-        wandb.log({"avg reward_"+str(task_id): np.mean([np.mean(traj['rewards']) for traj in trajectory_data])})
+        wandb.log({"avg reward_"+str(task_id): np.mean([np.mean(traj['rewards']) for traj in trajectory_data]), "success_rate_"+str(task_id): success_count / len(tasks), "success_count_"+str(task_id): success_count})
     if not cfg.testing:
-        wandb.log({"example": wandb.Video(path_)})
+        wandb.log({"example": wandb.Video(path_, format="mp4")})
     env.close()
     
     # Close HDF5 file if it was opened

@@ -79,6 +79,20 @@ class CEMPlanner(Planner):
         self.mu = torch.zeros(self.horizon, self.action_dim, device=self.cfg.device)  # Initial mean of action distribution
         self.std = torch.ones(self.horizon, self.action_dim, device=self.cfg.device)  # Initial std of action distribution
 
+    def load_world_model(self, path):
+        """Load pretrained world model from checkpoint."""
+
+        # Hydra may change the working directory (e.g., into `outputs/...`).
+        # Resolve relative paths against the hw2 folder (where `checkpoints/` lives).
+        p = os.path.expandvars(os.path.expanduser(str(path)))
+        p_path = Path(p)
+        if not p_path.is_absolute():
+            hw2_root = Path(__file__).resolve().parent
+            p_path = (hw2_root / p_path).resolve()
+
+         # Safer loading: `weights_only=True` avoids unpickling arbitrary objects.
+        self.world_model.load_state_dict(torch.load(path, map_location=self.device, weights_only=True))
+
     def plan(self, initial_state, return_best_sequence=True):
         """
         Plan action sequences using CEM to maximize predicted rewards.
@@ -179,7 +193,7 @@ class CEMPlanner(Planner):
                     'z_probs': step_out.get('z_probs', None),
                 }
             full_feat = torch.stack(full_feat, dim=1)  # (K, H, feat_dim)
-            r_t = self.world_model.reward_head(full_feat).sample()  # (K, H) because reward_head outputs normal distribution parameters and we take the mean as the predicted reward at each step
+            r_t = self.world_model.reward_head(full_feat)  # (K, H) because reward_head outputs normal distribution parameters and we take the mean as the predicted reward at each step
             total_rewards = r_t.sum(dim=-1)  # Sum rewards over the horizon to get total reward for each sequence (K,)
         return total_rewards
     
@@ -564,7 +578,7 @@ class PolicyPlanner(GRPBase):
                     'z_probs': step_out.get('z_probs', None),
                 }
             full_feat = torch.stack(full_feat, dim=1)  # (K, H, feat_dim)
-            r_t = self.world_model.reward_head(full_feat).sample()  # (K, H) because reward_head outputs normal distribution parameters and we take the mean as the predicted reward at each step
+            r_t = self.world_model.reward_head(full_feat)  # (K, H) because reward_head outputs normal distribution parameters and we take the mean as the predicted reward at each step
             total_rewards = r_t.sum(dim=-1)  # Sum rewards over the horizon to get total reward for each sequence (K,)
         return total_rewards
 
