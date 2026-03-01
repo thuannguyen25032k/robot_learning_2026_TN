@@ -193,7 +193,7 @@ class CEMPlanner(Planner):
                     'z_probs': step_out.get('z_probs', None),
                 }
             full_feat = torch.stack(full_feat, dim=1)  # (K, H, feat_dim)
-            r_t = self.world_model.reward_head(full_feat)  # (K, H) because reward_head outputs normal distribution parameters and we take the mean as the predicted reward at each step
+            r_t = self.world_model.reward_head(full_feat.view(self.K, self.horizon, -1)).view(self.K, self.horizon)  # (K, H) because reward_head outputs normal distribution parameters and we take the mean as the predicted reward at each step
             total_rewards = r_t.sum(dim=-1)  # Sum rewards over the horizon to get total reward for each sequence (K,)
         return total_rewards
     
@@ -578,8 +578,11 @@ class PolicyPlanner(GRPBase):
                     'z_probs': step_out.get('z_probs', None),
                 }
             full_feat = torch.stack(full_feat, dim=1)  # (K, H, feat_dim)
-            r_t = self.world_model.reward_head(full_feat)  # (K, H) because reward_head outputs normal distribution parameters and we take the mean as the predicted reward at each step
-            total_rewards = r_t.sum(dim=-1)  # Sum rewards over the horizon to get total reward for each sequence (K,)
+            # RewardPredictor outputs a scalar per feature vector.
+            # DreamerV3 trains reward in symlog-space (see DreamerV3.compute_loss),
+            # so here we sum predicted symlog rewards for ranking action sequences.
+            r_symlog = self.world_model.reward_head(full_feat.view(self.K * self.horizon, -1)).view(self.K, self.horizon)
+            total_rewards = r_symlog.sum(dim=-1)  # (K,)
         return total_rewards
 
     def _evaluate_sequences_simple(self, initial_state, action_sequences):

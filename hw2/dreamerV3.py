@@ -39,6 +39,14 @@ def symlog(x):
     """
     return torch.sign(x) * torch.log(torch.abs(x) + 1.0)
 
+
+def symexp(x):
+    """Inverse of symlog.
+
+    If y = symlog(x) = sign(x) * log(|x|+1), then x = symexp(y) = sign(y) * (exp(|y|)-1).
+    """
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1.0)
+
 class GRPBase(nn.Module):
     """Base class for GRP models"""
     def __init__(self, cfg):
@@ -448,13 +456,17 @@ class DreamerV3(GRPBase):
         if dones.dim() == 3 and dones.shape[-1] == 1:
             dones = dones.squeeze(-1)
 
-        # --- Reconstruction loss (pixel MSE in normalized space) ---
-        # Image Reconstruction Loss (MSE)
-        recon_loss = F.mse_loss(reconstructions, normalized_images)
+        # --- Reconstruction loss (symlog-squared in normalized space) ---
+        # DreamerV3 often uses symlog space for robustness. Here we apply
+        # a squared loss in symlog-space: ||symlog(x_hat) - symlog(x)||^2.
+        # Both reconstructions and normalized_images are expected in [-1, 1].
+        recon_loss = F.mse_loss(symlog(reconstructions), symlog(normalized_images))
 
         # --- Reward prediction loss ---
-        # A simple, robust choice: MSE on raw rewards.
-        reward_loss = F.mse_loss(rewards_pred, rewards)
+        # DreamerV3 commonly models reward/value in symlog-space for stability,
+        # especially when rewards are heavy-tailed or mostly negative (cost-style).
+        reward_target = symlog(rewards)
+        reward_loss = F.mse_loss(rewards_pred, reward_target)
 
         # Continue Predictor Loss (Binary Cross Entropy)
         # Model predicts whether the episode continues (1) or is done (0)
