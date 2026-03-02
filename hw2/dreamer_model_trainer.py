@@ -198,8 +198,8 @@ class ModelTrainingWrapper:
                 tgt_pose_seq = poses[:, 1:, :]
 
                 # Rewards are (B, T). Use the same alignment.
-                pred_rew_seq = pred_rewards[:, : T - 1]
-                tgt_rew_seq = rewards[:, 1:]
+                pred_rew_seq = pred_rewards
+                tgt_rew_seq = rewards
 
                 loss = self.model.compute_loss(
                     pred_pose_seq,
@@ -647,7 +647,7 @@ def my_main(cfg: DictConfig):
         if epoch % cfg.eval_vid_iters == 0:
             torch.save(model.state_dict(), os.path.join(subcheckpoint_dir, f'model_epoch_{epoch+1}_batch_{batch_counter}.pth'), pickle_module=dill)
             # Save policy model if using policy-based planner
-            if cfg.use_policy and cfg.planner.type=='policy':
+            if cfg.use_policy:
                 torch.save(planner.policy_model.state_dict(), os.path.join(subcheckpoint_dir, f'policy.pth'), pickle_module=dill)
             # Evaluate the model using eval_libero from sim_eval
             print("[info] Starting evaluation on LIBERO tasks...")

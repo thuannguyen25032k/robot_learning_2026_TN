@@ -47,7 +47,7 @@ class DecoderConv(nn.Module):
             nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),  # (B, 32, H/2, W/2)
             nn.ReLU(),
             nn.ConvTranspose2d(32, channels, kernel_size=3, stride=2, padding=1, output_padding=1),  # (B, channels, H, W)
-            nn.Tanh()  # Assuming output is normalized to [-1, 1]
+            # nn.Tanh()  # Assuming output is normalized to [-1, 1]
         )
 
     def forward(self, x):

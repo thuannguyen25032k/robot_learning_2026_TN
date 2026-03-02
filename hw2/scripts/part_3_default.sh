@@ -19,6 +19,8 @@ nohup python dreamer_model_trainer.py \
     planner.num_elites=10 \
     planner.num_iterations=20 \
     planner.temperature=0.4 \
+    max_iters=2000 \
+    +load_world_model=./checkpoints/q3_dreamer_cem_H_15/model_epoch_1801_batch_48.pth \
     exp_name=q3_dreamer_cem_H_15 \
     experiment.name=q3_dreamer_cem_H_15 \
     policy.sequence_length=50 \

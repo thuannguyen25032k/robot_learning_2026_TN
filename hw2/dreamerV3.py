@@ -456,11 +456,9 @@ class DreamerV3(GRPBase):
         if dones.dim() == 3 and dones.shape[-1] == 1:
             dones = dones.squeeze(-1)
 
-        # --- Reconstruction loss (symlog-squared in normalized space) ---
-        # DreamerV3 often uses symlog space for robustness. Here we apply
-        # a squared loss in symlog-space: ||symlog(x_hat) - symlog(x)||^2.
-        # Both reconstructions and normalized_images are expected in [-1, 1].
-        recon_loss = F.mse_loss(symlog(reconstructions), symlog(normalized_images))
+        # --- Reconstruction loss (pixel MSE in normalized space) ---
+        # Image Reconstruction Loss (MSE)
+        recon_loss = F.mse_loss(reconstructions, normalized_images)
 
         # --- Reward prediction loss ---
         # DreamerV3 commonly models reward/value in symlog-space for stability,
