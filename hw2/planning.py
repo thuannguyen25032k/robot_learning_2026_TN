@@ -129,7 +129,7 @@ class CEMPlanner(Planner):
             # Update the mean and std of the action distribution using the elites
             new_mu = elite_action_sequences.mean(dim=0)  # (H, action_dim)
             # We could use unbiased=False to avoid NaN when M==1 (avoids division by N-1=0)
-            new_std = elite_action_sequences.std(dim=0, unbiased=True).clamp(min=1e-6)  # (H, action_dim)
+            new_std = elite_action_sequences.std(dim=0, unbiased=True).clamp(min=1e-3)  # (H, action_dim)
             
             # Smoothly update the distribution parameters with temperature alpha
             mu = self.alpha * new_mu + (1 - self.alpha) * mu
@@ -518,7 +518,7 @@ class PolicyPlanner(GRPBase):
             # Update the mean and std of the action distribution using the elites
             new_mu = elite_action_sequences.mean(dim=0)  # (H, action_dim)
             # We could use unbiased=False to avoid NaN when M==1 (avoids division by N-1=0)
-            new_std = elite_action_sequences.std(dim=0, unbiased=True).clamp(min=1e-6)  # (H, action_dim)
+            new_std = elite_action_sequences.std(dim=0, unbiased=True).clamp(min=1e-3)  # (H, action_dim)
             
             # Smoothly update the distribution parameters with temperature alpha
             mu = self.alpha * new_mu + (1 - self.alpha) * mu
@@ -558,7 +558,18 @@ class PolicyPlanner(GRPBase):
                 "DreamerV3 planning requires initial_state with keys {'h','z'} (and optionally 'z_probs')."
             )
 
-        state = initial_state
+        # We evaluate K candidate action sequences in parallel.
+        # Expand the RSSM state to match the action batch dimension (K).
+        K = action_sequences.shape[0]
+        state = {
+            'h': initial_state['h'].expand(K, -1).contiguous(),
+            'z': initial_state['z'].expand(K, -1).contiguous(),
+        }
+        if 'z_probs' in initial_state and initial_state['z_probs'] is not None:
+            # z_probs may be (B, Z, C). Expand along batch.
+            state['z_probs'] = initial_state['z_probs'].expand(K, -1, -1).contiguous()
+        else:
+            state['z_probs'] = None
 
         self.world_model.eval()
         full_feat = []
@@ -581,7 +592,7 @@ class PolicyPlanner(GRPBase):
             # RewardPredictor outputs a scalar per feature vector.
             # DreamerV3 trains reward in symlog-space (see DreamerV3.compute_loss),
             # so here we sum predicted symlog rewards for ranking action sequences.
-            r_symlog = self.world_model.reward_head(full_feat.view(self.K * self.horizon, -1)).view(self.K, self.horizon)
+            r_symlog = self.world_model.reward_head(full_feat.view(K * self.horizon, -1)).view(K, self.horizon)
             total_rewards = r_symlog.sum(dim=-1)  # (K,)
         return total_rewards
 
@@ -671,7 +682,7 @@ class PolicyPlanner(GRPBase):
 
         # Build current RSSM state from the provided history.
         if prev_state is None:
-            print("No previous state provided; initializing new RSSM state.")
+            # print("No previous state provided; initializing new RSSM state.")
             state = self.world_model.get_initial_state(B, device=self.device)
         else:
             state = prev_state

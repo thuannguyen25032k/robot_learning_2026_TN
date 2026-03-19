@@ -201,13 +201,13 @@ class ModelTrainingWrapper:
                 pred_rew_seq = pred_rewards
                 tgt_rew_seq = rewards
 
-                loss = self.model.compute_loss(
+                loss_dict = self.model.compute_loss(
                     pred_pose_seq,
                     pred_rew_seq,
                     target_pose=tgt_pose_seq,
                     target_reward=tgt_rew_seq,
                 )
-                return loss
+                return loss_dict
 
             raise ValueError(f"Unexpected pred_poses shape: {pred_poses.shape}")
 
@@ -574,7 +574,9 @@ def my_main(cfg: DictConfig):
             ## Call model_wrapper.forward_pass() with appropriate inputs based on model type
             if model_type == 'dreamer':
                 if (cfg.use_policy and (cfg.planner.type == 'policy' or cfg.planner.type == 'policy_guided_cem')):  
-                    policy_loss = planner.update(normalized_poses, normalized_actions)
+                    # PolicyPlanner.update() for Dreamer expects image sequences (B,T,C,H,W)
+                    # so it can encode them and build RSSM features [h,z] as policy inputs.
+                    policy_loss = planner.update(normalized_images, normalized_actions)
                 model_out = model_wrapper.forward_pass(normalized_images, None, normalized_actions)
                 loss_dict = model_wrapper.compute_loss(
                     model_out,
@@ -593,7 +595,7 @@ def my_main(cfg: DictConfig):
                     normalized_poses,
                     normalized_actions,
                 )
-                batch_loss = model_wrapper.compute_loss(
+                loss_dict = model_wrapper.compute_loss(
                     model_out,
                     None,
                     rewards,
@@ -601,7 +603,7 @@ def my_main(cfg: DictConfig):
                     normalized_poses,
                     normalized_actions,
                 )
-                loss_dict = None
+                batch_loss = loss_dict['total_loss']
             else:
                 raise ValueError(f"Unknown model type: {model_type}")
             optimizer.zero_grad()
@@ -612,7 +614,7 @@ def my_main(cfg: DictConfig):
             loss = batch_loss.item()
             batch_counter += 1
             # Implement data loading and training step for the batch
-            if loss_dict is not None:
+            if model_type == 'dreamer':
                 # Dreamer: log the components for quick debugging.
                 print(
                     f"Epoch [{epoch+1}/{cfg.max_iters }], Batch [{batch_counter}/{(len(dataset) + cfg.batch_size - 1) // cfg.batch_size}], "
@@ -628,19 +630,36 @@ def my_main(cfg: DictConfig):
 
         # Log training loss to wandb
         if wandb is not None:
-            log_payload = {"train_loss": loss, "policy_loss": policy_loss}
-            # If the last computed loss was Dreamer-style, add its components.
-            if 'loss_dict' in locals() and isinstance(locals().get('loss_dict', None), dict):
-                ld = locals()['loss_dict']
-                log_payload.update(
-                    {
-                        "loss/recon": float(ld['recon_loss'].detach().cpu()),
-                        "loss/reward": float(ld['reward_loss'].detach().cpu()),
-                        "loss/continue": float(ld['continue_loss'].detach().cpu()),
-                        "loss/dyn": float(ld['dyn_loss'].detach().cpu()),
-                        "loss/rep": float(ld['rep_loss'].detach().cpu()),
-                    }
-                )
+            if model_type == 'dreamer':
+                log_payload = {
+                    "train_loss": loss,
+                    "policy_loss": policy_loss,
+                    "loss/recon": float(loss_dict['recon_loss'].detach().cpu()),
+                    "loss/reward": float(loss_dict['reward_loss'].detach().cpu()),
+                    "loss/continue": float(loss_dict['continue_loss'].detach().cpu()),
+                    "loss/dyn": float(loss_dict['dyn_loss'].detach().cpu()),
+                    "loss/rep": float(loss_dict['rep_loss'].detach().cpu()),
+                }
+            else:
+                log_payload = {
+                    "train_loss": loss, 
+                    "policy_loss": policy_loss,
+                    "pose_loss": float(loss_dict['pose_loss'].detach().cpu()),
+                    "reward_loss": float(loss_dict['reward_loss'].detach().cpu())
+                }
+            # log_payload = {"train_loss": loss, "policy_loss": policy_loss}
+            # # If the last computed loss was Dreamer-style, add its components.
+            # if 'loss_dict' in locals() and isinstance(locals().get('loss_dict', None), dict):
+            #     ld = locals()['loss_dict']
+            #     log_payload.update(
+            #         {
+            #             "loss/recon": float(ld['recon_loss'].detach().cpu()),
+            #             "loss/reward": float(ld['reward_loss'].detach().cpu()),
+            #             "loss/continue": float(ld['continue_loss'].detach().cpu()),
+            #             "loss/dyn": float(ld['dyn_loss'].detach().cpu()),
+            #             "loss/rep": float(ld['rep_loss'].detach().cpu()),
+            #         }
+            #     )
             wandb.log(log_payload)
 
         # save the model checkpoint

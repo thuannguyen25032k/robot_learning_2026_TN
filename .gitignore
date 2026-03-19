@@ -7,7 +7,10 @@ hw2/logs/
 hw2/outputs/
 hw2/videos/
 hw2/wandb/
+hw2/submission/
 mini-grp/miniGRP.pth 
+submit/
+hw2_submission
 
 # --- Common Python ignores (nice-to-have) ---
 __pycache__/

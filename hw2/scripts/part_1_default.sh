@@ -19,10 +19,10 @@ nohup python dreamer_model_trainer.py \
     planner.horizon=10 \
     planner.num_samples=100 \
     planner.num_elites=10 \
-    planner.num_iterations=50 \
+    planner.num_iterations=20 \
     planner.temperature=0.4 \
     policy.sequence_length=50 \
-    max_iters=100 \
+    max_iters=5000 \
     exp_name=q1_simple_cem_H_10 \
     experiment.name=q1_simple_cem_H_10 \
     use_policy=false \

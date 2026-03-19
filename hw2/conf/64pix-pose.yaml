@@ -44,7 +44,7 @@ max_block_size: 16 ## Tokens for langauge processing
 vocab_size: 32 ## Will be overidden by code
 n_patches: 8
 patch_size: 8
-max_iters: 5000
+max_iters: 2500
 eval_interval: 100 # How often to run eval over the validation set
 learning_rate: 3e-4
 lr_schedule: linear ## ['inverse_sqrt', 'linear']

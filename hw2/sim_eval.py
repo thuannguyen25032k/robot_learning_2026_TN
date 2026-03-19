@@ -3,6 +3,7 @@ import dill
 import h5py
 import numpy as np
 import torch
+import time
 
 def get_text_tokens(cfg, tokenizer, text_model, goal, model=None):
     """
@@ -216,7 +217,9 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
     # retrieve a specific task
     tasks = cfg.sim.eval_tasks
     success_count = 0
+    total_time = 0
     for idx, task_id in enumerate(tasks):
+        count = 0
         task = task_suite.get_task(task_id)
         task_name = task.name
         instruction = task.language
@@ -333,6 +336,8 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
 
                 # print(f"Step {t}, obs_state shape: {observations_tensor.shape}, text_goal shape: {text_goal_tensor.shape}, goal_image shape: {goal_image_tensor.shape}, pose shape: {pose_.shape}, last_action shape: {last_action_tensor.shape if last_action_tensor is not None else None}")
                 # Note that: return_full_sequence=False by default, so we only get the next action, not the whole sequence of future actions
+                count+=1
+                start_time = time.time()
                 out = model.forward(
                     observations=observations_tensor,
                     text_goal=text_goal_tensor,
@@ -341,6 +346,8 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
                     pose=pose_,
                     prev_actions=last_action_tensor,
                 )
+                end_time = time.time()
+                total_time += (end_time - start_time)
                 action = model.decode_action(out['actions'][0]).cpu().detach().numpy()
                 # action = out['actions'][0].cpu().detach().numpy()  # Assuming the model's output is already in the correct action space and does not require decoding
                 last_action = action.copy()  # Store for next iteration 
@@ -385,6 +392,7 @@ def eval_libero(model, device, cfg, iter_=0, log_dir="./",
             path_ = os.path.join(sub_video_dir, f"libero-{iter_}-task-id-{task_id}-idx-{idx}-init-id-{init_state_id}.mp4")
             import imageio
             imageio.mimsave(path_, frames, fps=20)
+    print(f"Average planning time per episode: {total_time / len(tasks):.2f} seconds")
     episode_stats = info.get('episode_stats', {})
     episode_stats['rewards'] = np.mean([np.mean(traj['rewards']) for traj in trajectory_data])
     episode_stats['video_url'] = path_

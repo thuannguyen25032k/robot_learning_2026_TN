@@ -17,7 +17,7 @@ nohup python dreamer_model_trainer.py \
     model_type=simple \
     planner.type=policy_guided_cem \
     planner.horizon=15 \
-    planner.num_samples=100 \
+    planner.num_samples=50 \
     planner.num_elites=10 \
     planner.num_iterations=10 \
     policy.sequence_length=20 \

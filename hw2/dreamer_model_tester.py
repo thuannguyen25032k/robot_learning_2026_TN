@@ -65,47 +65,6 @@ def create_model(model_type, img_shape, action_dim, device, cfg):
 
     return model
 
-
-class LIBERODataset(torch.utils.data.Dataset):
-    def __init__(self, data_dir, transform=None):
-        self.data_dir = data_dir
-        self.transform = transform
-
-        # crawl the data_dir and build the index map for h5py files
-        self.index_map = []
-        for root, dirs, files in os.walk(self.data_dir):
-            for file in files:
-                if file.endswith('.hdf5') or file.endswith('.h5'):
-                    file_path = os.path.join(root, file)
-                    with h5py.File(file_path, 'r') as f:
-                        for demo_key in f['data'].keys():
-                            self.index_map.append((file_path, demo_key))
-
-    def __len__(self):
-        return len(self.index_map)
-
-    def __getitem__(self, idx):
-        # Load your data here
-        # data_path = os.path.join(self.data_dir, self.data_files[idx])
-        file_path, demo_key = self.index_map[idx]
-        # data_list = []
-        with h5py.File(file_path, 'r') as f:
-            # for demo in f['data'].keys():
-            demo = f['data'][demo_key]
-            image = torch.from_numpy(
-                f['data'][demo_key]['obs']['agentview_rgb'][()])
-            action = torch.from_numpy(f['data'][demo_key]['actions'][()])
-            dones = torch.from_numpy(f['data'][demo_key]['dones'][()])
-            rewards = torch.from_numpy(f['data'][demo_key]['rewards'][()])
-            # poses = torch.from_numpy(f['data'][demo_key]['robot_states'][()])
-            poses = torch.from_numpy(np.concatenate((f['data'][demo_key]['obs']["ee_pos"],
-                                                     f['data'][demo_key]['obs']["ee_ori"][:, :3],
-                                                     (f['data'][demo_key]['obs']["gripper_states"][:, :1])), axis=-1))
-            # Note: Images are returned in channel-last format (T, H, W, C)
-            # Conversion to channel-first (T, C, H, W) happens in the training loop
-        # Return the image and label if needed
-        return image, action, rewards, dones, poses
-
 # ---------------------------------------------------------------------------
 # Powerful stochastic policy network
 # ---------------------------------------------------------------------------
@@ -200,7 +159,9 @@ def my_main(cfg: DictConfig):
     img_shape = [3, 64, 64]
     model = create_model(model_type, img_shape,
                          action_dim=7, device=device, cfg=cfg)
-
+    # Print out model summary
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"[info] Initialized {model_type} model with {total_params:,} parameters")
     # Initialize planner (works with both model types through the model interface)
     if cfg.use_policy:
         print("[info] Using policy-based planner (CEMPlanner with policy)")
@@ -217,6 +178,9 @@ def my_main(cfg: DictConfig):
         # Stochastic policy: outputs [mean (Tanh-bounded), log_std] concatenated → shape (B, 14).
         # _PolicyNet: deep residual MLP with pre-norm blocks and separate mean/log-std heads.
         policy = PolicyNet(in_dim=policy_in_dim, action_dim=7, hidden_dim=256, n_layers=2, dropout=cfg.policy.dropout)
+        # Print out policy summary
+        policy_params = sum(p.numel() for p in policy.parameters())
+        print(f"[info] Initialized policy network with {policy_params:,} parameters")
         policy.to(device)
         planner = PolicyPlanner(
             model,

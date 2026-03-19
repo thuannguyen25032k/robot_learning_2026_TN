@@ -11,7 +11,7 @@
 mkdir -p logs
 nohup python dreamer_model_trainer.py \
     model_type=simple \
-    max_iters=50 \
+    max_iters=500 \
     planner.type=policy \
     planner.horizon=15 \
     planner.num_samples=100 \
@@ -20,7 +20,7 @@ nohup python dreamer_model_trainer.py \
     policy.sequence_length=20 \
     planner.temperature=0.4 \
     sim.eval_tasks="[0]" \
-    +load_world_model=./checkpoints/q1_simple_cem_H_15/world_model.pth \
+    +load_world_model=./checkpoints/q1_simple_cem_H_10/world_model.pth \
     exp_name=q2_policy_training_default \
     experiment.name=q2_policy_training_default \
     use_policy=true \

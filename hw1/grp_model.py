@@ -100,10 +100,35 @@ class GRP(nn.Module):
         cfg.vocab_size = len(chars)
         # TODO: 
         ## Provide the logic for the GRP network
+        # 1) Patch embedding layer
+        self.patch_embedding = nn.Linear(cfg.patch_size * cfg.patch_size * 3, cfg.n_embd)
+        # 2) Learnable token embeddings for classification and goal image tokens
+        self.class_token = nn.Parameter(torch.zeros(1, 1, cfg.n_embd))
+        self.goal_token = nn.Parameter(torch.zeros(1, 1, cfg.n_embd))
+        # 3) Token embedding table for text goals (if not using T5)
+        self.token_embedding_table = nn.Embedding(cfg.vocab_size, cfg.n_embd)   
+        self.dropout = nn.Dropout(cfg.dropout)
 
         # 4) Transformer encoder blocks
+        self.blocks = nn.ModuleList([Block(cfg.n_embd, cfg.n_head, cfg.dropout) for _ in range(cfg.n_blocks)])
+        self.ln_f = nn.LayerNorm(cfg.n_embd)
 
-        # 5) Classification MLPk
+        # 5) Classification MLP head
+        if cfg.action_space == "continuous":
+            self.action_head = nn.Sequential(
+                nn.Linear(cfg.n_embd, cfg.n_embd * mlp_ratio),
+                nn.ReLU(),
+                nn.Linear(cfg.n_embd * mlp_ratio, cfg.action_dim * cfg.policy.action_stacking)
+            )
+        elif cfg.action_space == "discrete":
+            self.action_head = nn.Sequential(
+                nn.Linear(cfg.n_embd, cfg.n_embd * mlp_ratio),
+                nn.ReLU(),
+                nn.Linear(cfg.n_embd * mlp_ratio, cfg.action_dim * cfg.policy.action_stacking * 14)
+            )
+        # Weight initialization
+        self.apply(self._init_weights)
+        # Initialize learnable tokens with small random values instead of zeros
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -113,7 +138,7 @@ class GRP(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, images, goals_txt, goal_imgs, targets=None, pose=None, mask_=False, last_action=None):
+    def forward(self, images, goals_txt, goal_imgs, targets=None, pose=None, mask_=True):
         n, c, h, w = images.shape
         obs_patches = get_patches_fast(images, self._cfg)
         patches_g = get_patches_fast(goal_imgs, self._cfg)
@@ -129,16 +154,71 @@ class GRP(nn.Module):
         ## Provide the logic to produce the output and loss for the GRP
         
         # Map the vector corresponding to each patch to the hidden size dimension
+        obs_tokens = self.patch_embedding(obs_patches)  # (n, n_patches, n_embd)
+        goal_img_tokens = self.patch_embedding(patches_g)  # (n, n_patches, n_embd)
 
         # Adding classification and goal_img tokens to the tokens
-
+        cls_token = self.class_token.expand(B, -1, -1)  # (batch, 1, n_embd)
+        goal_token = self.goal_token.expand(B, -1, -1)  # (batch, 1, n_embd)
+        x = torch.cat([cls_token, obs_tokens, goal_token, goal_img_tokens, goals_e], dim=1)  # (batch, total_tokens, n_embd)
         # Adding positional embedding
+        pos_emb = calc_positional_embeddings(x.shape[1], self._cfg.n_embd).to(x.device)
+        x = x + pos_emb.unsqueeze(0)[:, :x.shape[1], :]
+        x = self.dropout(x)
 
         # Compute blocked masks
+        att_mask = torch.ones((B, x.shape[1]), device=x.device)
+        if mask_:
+            total_patches = (self._cfg.image_shape[0] // self._cfg.patch_size) * (self._cfg.image_shape[1] // self._cfg.patch_size)
+            obs_start = 1
+            obs_end = obs_start + total_patches * self._cfg.policy.obs_stacking
+            goal_img_start = obs_end + 1
+            goal_img_end = goal_img_start + total_patches
+            goal_text_start = goal_img_end
+            goal_text_end = goal_text_start + T
 
-        # Transformer Blocks
+            assert x.shape[1] == goal_text_end
 
-        # Getting the classification token only
+            # Create attention mask
+            # Randomly mask Text or Image goal
+            rand_val = torch.rand(n, device=x.device)
+            mask_text = (rand_val < 0.33).unsqueeze(1)  # (B, 1)
+            mask_image = (rand_val > 0.66).unsqueeze(1)  # (B, 1)
+
+            # Apply masking (0 = ignore, 1 = attend)
+            att_mask[:, goal_text_start:goal_text_end].masked_fill_(mask_text, 0)
+            att_mask[:, goal_img_start:goal_img_end].masked_fill_(mask_image, 0)
+
+        block_mask = att_mask.unsqueeze(1)  # (B, 1, T)
+        
+        # Pass the mask to transformer blocks
+        for block in self.blocks:
+            x = block(x, mask=block_mask) 
+
+        x = self.ln_f(x)
+        
+        if targets is not None:
+            if self._cfg.action_space == "continuous":
+                out = self.action_head(x[:, 0, :])  # (batch, action_dim * action_stacking)
+                loss = F.mse_loss(out, targets)
+            elif self._cfg.action_space == "discrete":
+                logits = self.action_head(x[:, 0, :]).view(B, -1, 14)  # (B, action_dim * action_stacking, 14)
+                targets_clamped = torch.clamp(targets, -1, 1)  # Ensure targets are within valid range
+                targets_bins = ((targets_clamped + 1) / 2 * 13).long()  # Map targets from [-1, 1] to [0, 13]
+                loss = F.cross_entropy(logits.permute(0, 2, 1), targets_bins)
+                out = logits.argmax(dim=-1)
+
+        else:
+            if self._cfg.action_space == "continuous":
+                out = self.action_head(x[:, 0, :])  # (batch, action_dim * action_stacking)
+                loss = torch.tensor(0.0, device=out.device)
+            elif self._cfg.action_space == "discrete":
+                logits = self.action_head(x[:, 0, :]).view(B, -1, 14)  # (B, action_dim * action_stacking, 14)
+                bin_idxs = logits.argmax(dim=-1).float()
+                # Convert bin indices back to continuous values in [-1, 1]
+                out = (bin_idxs / 13.0) * 2.0 - 1.0
+                loss = torch.tensor(0.0, device=out.device)
+            # print("No targets provided, loss set to 0.0")
 
         # Compute output and loss
         return (out, loss)
@@ -194,7 +274,13 @@ class GRP(nn.Module):
                 raise ValueError("tokenizer and text_model must be provided when using T5 encoding")
             # TODO:    
             ## Provide the logic converting text goal to T5 embedding tensor
-            pass
+            device = text_model.device
+            tokens = tokenizer(goal, return_tensors="pt").input_ids.to(device)
+
+            with _torch.no_grad():
+                embedding = text_model.encoder(tokens).last_hidden_state
+            
+            return embedding.to(self._cfg.device)
         else:
             pad = " " * self._cfg.max_block_size
             goal_ = goal[:self._cfg.max_block_size] + pad[len(goal):self._cfg.max_block_size]
