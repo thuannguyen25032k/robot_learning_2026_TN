@@ -14,6 +14,7 @@ hw2_submission
 hw3/logs
 hw3/outputs
 hw3/wandb
+hw3/checkpoints
 
 # --- Common Python ignores (nice-to-have) ---
 __pycache__/
