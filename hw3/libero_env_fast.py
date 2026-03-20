@@ -271,12 +271,16 @@ class FastLIBEROEnv:
         # (b) gripper is closed (proxy), and (c) bowl is moving (proxy for contact).
         reach_eps = 0.06  # 6cm
         g_reach = float(np.clip((reach_eps - d_gb) / max(reach_eps, 1e-6), 0.0, 1.0))
-
+        
         # Gripper closure proxy.
         # Convention is env-dependent; in many robosuite variants smaller qpos ~= more closed.
         close_lo, close_hi = 0.01, 0.04
         g_close = float(np.clip((close_hi - gripper_qpos) / max(close_hi - close_lo, 1e-6), 0.0, 1.0))
 
+        # Geometry check: Is the bowl center physically between the fingers?
+        # d_gb is the distance from the effector to the bowl.
+        g_in_palm = float(d_gb < 0.03)
+        
         # Bowl-follow proxy (movement indicates interaction).
         bowl_follow = 0.0
         if bowl_pos is not None:
@@ -288,8 +292,10 @@ class FastLIBEROEnv:
             bowl_follow = float(np.clip(bowl_move / 0.02, 0.0, 1.0))
             self._prev_bowl_pos_world = bowl_pos.copy()
 
-        # Instantaneous grasp score (0..1)
-        grasp_score = g_reach * (0.6 * g_close + 0.4 * bowl_follow)
+        # --- Combined Grasp Score ---
+        # We want this to be 1.0 when:
+        # We are at the bowl AND (We are squeezing it OR We are moving it)
+        grasp_score = g_reach * np.max([g_close * g_in_palm, bowl_follow])
 
         # Persistent hold confidence (EMA with slower decay than growth).
         alpha_up, alpha_down = 0.2, 0.05
