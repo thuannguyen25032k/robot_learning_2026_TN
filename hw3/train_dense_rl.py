@@ -16,6 +16,14 @@ Usage:
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from pathlib import Path
+os.environ["MUJOCO_GL"] = "egl"
+# Ensure the vendored LIBERO package is importable even if it hasn't been pip-installed.
+# Hydra may change the working directory, so we resolve relative to this file.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_LIBERO_ROOT = _REPO_ROOT / "LIBERO"
+if _LIBERO_ROOT.exists():
+    sys.path.insert(0, str(_LIBERO_ROOT))
 
 import numpy as np
 import torch
@@ -40,8 +48,35 @@ class DensePolicy(nn.Module):
     """
     def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 256, n_layers: int = 3):
         super().__init__()
-        # TODO: Build the policy network layers and output heads.
-        pass
+        if n_layers < 1:
+            raise ValueError(f"n_layers must be >= 1, got {n_layers}")
+
+        layers = []
+        in_dim = obs_dim
+        for _ in range(n_layers):
+            module = nn.Linear(in_dim, hidden_dim)
+            # Orthogonal init for stability
+            nn.init.orthogonal_(module.weight, gain=nn.init.calculate_gain('tanh'))
+            nn.init.constant_(module.bias, 0)
+            
+            layers.append(module)
+            layers.append(nn.Tanh())
+            in_dim = hidden_dim
+
+        self.net = nn.Sequential(*layers)
+        self.mean_head = nn.Linear(hidden_dim, action_dim)
+        # Mean head usually initialized with gain 0.01 for smaller initial actions.
+        nn.init.orthogonal_(self.mean_head.weight, gain=0.01)
+        nn.init.zeros_(self.mean_head.bias)
+
+        # PPO-friendly default: state-independent log std (one per action dim).
+        # This is widely used and tends to be more stable than predicting std from obs.
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.tanh = nn.Tanh() 
+
+        # Numerical safety bounds for std; can be overridden later if needed.
+        self.log_std_min = -5.0
+        self.log_std_max = 2.0
 
     def forward(self, obs: torch.Tensor):
         """
@@ -50,8 +85,13 @@ class DensePolicy(nn.Module):
         Returns:
             dist: torch.distributions.Normal over actions
         """
-        # TODO: Return a Normal distribution over actions given obs.
-        pass
+        h = self.net(obs)
+        mean = self.mean_head(h)
+
+        # Expand (action_dim,) -> (B, action_dim) without allocating new storage.
+        log_std = self.log_std.clamp(self.log_std_min, self.log_std_max)
+        std = log_std.exp().expand_as(mean)
+        return Normal(mean, std)
 
     def get_action(self, obs: torch.Tensor, deterministic: bool = False):
         """Sample an action and return (action, log_prob, entropy)."""
@@ -70,8 +110,27 @@ class DenseValueFunction(nn.Module):
     """MLP value function V(s) for PPO critic."""
     def __init__(self, obs_dim: int, hidden_dim: int = 256, n_layers: int = 3):
         super().__init__()
-        # TODO: Build the value network layers.
-        pass
+        if n_layers < 1:
+            raise ValueError(f"n_layers must be >= 1, got {n_layers}")
+
+        layers = []
+        in_dim = obs_dim
+        for _ in range(n_layers):
+            module = nn.Linear(in_dim, hidden_dim)
+            # Orthogonal init for stability
+            nn.init.orthogonal_(module.weight, gain=nn.init.calculate_gain('tanh'))
+            nn.init.constant_(module.bias, 0)
+            
+            layers.append(module)
+            layers.append(nn.Tanh())
+            in_dim = hidden_dim
+
+        self.net = nn.Sequential(*layers)
+        self.value_head = nn.Linear(hidden_dim, 1)
+        
+        # Value head usually initialized with gain 1.0
+        nn.init.orthogonal_(self.value_head.weight, gain=1.0)
+        nn.init.zeros_(self.value_head.bias)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         """Returns scalar value estimate of shape (B,)."""
@@ -123,10 +182,24 @@ class RolloutBuffer:
             returns: (rollout_length,) tensor
             advantages: (rollout_length,) tensor
         """
-        # TODO: Compute GAE advantages and discounted returns.
+        # Compute GAE advantages.
+        # Returns are then R_t = A_t + V(s_t).
         returns = torch.zeros_like(self.rewards)
         advantages = torch.zeros_like(self.rewards)
-        pass
+
+        # Ensure scalar for bootstrap value.
+        next_value = last_value.squeeze()
+        next_adv = torch.zeros((), device=self.device)
+
+        for t in reversed(range(self.rollout_length)):
+            not_done = 1.0 - self.dones[t]
+            delta = self.rewards[t] + gamma * next_value * not_done - self.values[t]
+            next_adv = delta + gamma * gae_lambda * not_done * next_adv
+            advantages[t] = next_adv
+            returns[t] = advantages[t] + self.values[t]
+            next_value = self.values[t]
+
+        return returns, advantages
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +218,98 @@ def ppo_update(policy: DensePolicy,
 
     Returns a dict of mean losses for logging.
     """
-    # TODO: Implement PPO minibatch updates over ppo_epochs.
-    return {}
+    # Flatten rollout (T, ...) -> (N, ...)
+    obs = buffer.obs.detach()
+    actions = buffer.actions.detach()
+    old_log_probs = buffer.log_probs.detach()
+    returns = returns.detach()
+    advantages = advantages.detach()
+
+    # PPO commonly normalizes advantages per update batch.
+    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+
+    n = obs.shape[0]
+    mb = int(cfg.training.minibatch_size)
+    if mb <= 0:
+        raise ValueError(f"training.minibatch_size must be > 0, got {mb}")
+    if mb > n:
+        mb = n
+
+    # Support both naming conventions used across configs.
+    clip_eps = float(getattr(cfg.training, "clip_epsilon", getattr(cfg.training, "clip_eps")))
+    value_coef = float(getattr(cfg.training, "value_coef", getattr(cfg.training, "value_coeff")))
+    entropy_coef = float(getattr(cfg.training, "entropy_coef", getattr(cfg.training, "entropy_coeff")))
+    max_grad_norm = float(getattr(cfg.training, "max_grad_norm", 0.0))
+
+    # For logging
+    policy_losses = []
+    value_losses = []
+    entropies = []
+    approx_kls = []
+    clip_fracs = []
+
+    for _epoch in range(int(cfg.training.ppo_epochs)):
+        perm = torch.randperm(n, device=obs.device)
+        for start in range(0, n, mb):
+            idx = perm[start:start + mb]
+
+            mb_obs = obs[idx]
+            mb_actions = actions[idx]
+            mb_old_logp = old_log_probs[idx]
+            mb_returns = returns[idx]
+            mb_adv = advantages[idx]
+
+            dist = policy(mb_obs)
+            new_logp = dist.log_prob(mb_actions).sum(-1)
+            entropy = dist.entropy().sum(-1).mean()
+
+            values_pred = value_fn(mb_obs)
+
+            # Ratio for clipped surrogate objective.
+            log_ratio = new_logp - mb_old_logp
+            ratio = torch.exp(log_ratio)
+
+            surr1 = ratio * mb_adv
+            surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
+            policy_loss = -torch.min(surr1, surr2).mean()
+
+            # Value function loss (simple MSE).
+            value_loss = 0.5 * F.mse_loss(values_pred, mb_returns)
+
+            loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if max_grad_norm and max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    list(policy.parameters()) + list(value_fn.parameters()),
+                    max_grad_norm,
+                )
+            optimizer.step()
+
+            # Logging stats
+            with torch.no_grad():
+                approx_kl = (mb_old_logp - new_logp).mean()
+                clipped = (torch.abs(ratio - 1.0) > clip_eps).float().mean()
+
+            policy_losses.append(policy_loss.detach())
+            value_losses.append(value_loss.detach())
+            entropies.append(entropy.detach())
+            approx_kls.append(approx_kl.detach())
+            clip_fracs.append(clipped.detach())
+
+    def _mean(xs):
+        if not xs:
+            return 0.0
+        return torch.stack(list(xs)).mean().item()
+
+    return {
+        "policy_loss": _mean(policy_losses),
+        "value_loss": _mean(value_losses),
+        "entropy": _mean(entropies),
+        "approx_kl": _mean(approx_kls),
+        "clip_frac": _mean(clip_fracs),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -270,11 +433,13 @@ def main(cfg: DictConfig):
                 "total_steps": total_steps,
                 "cfg": OmegaConf.to_container(cfg),
             }
-            torch.save(ckpt, f"dense_ppo_{total_steps}.pth")
+            # Make a directory for checkpoints if it doesn't exist.
+            os.makedirs(os.path.join("checkpoints", cfg.experiment.name), exist_ok=True)
+            torch.save(ckpt, os.path.join("checkpoints", cfg.experiment.name, f"dense_ppo_{total_steps}.pth"))
 
     # Final save
     torch.save({"policy": policy.state_dict(), "cfg": OmegaConf.to_container(cfg)},
-               "dense_ppo_final.pth")
+               os.path.join("checkpoints", cfg.experiment.name, "dense_ppo_final.pth"))
     env.close()
     wandb.finish()
 

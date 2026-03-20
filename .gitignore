@@ -11,6 +11,9 @@ hw2/submission/
 mini-grp/miniGRP.pth 
 submit/
 hw2_submission
+hw3/logs
+hw3/outputs
+hw3/wandb
 
 # --- Common Python ignores (nice-to-have) ---
 __pycache__/

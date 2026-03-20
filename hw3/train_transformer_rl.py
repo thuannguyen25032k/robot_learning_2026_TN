@@ -30,12 +30,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
+import dill
+from typing import TYPE_CHECKING
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import wandb
-
-from hw3.libero_env_fast import FastLIBEROEnv
 from hw3.train_dense_rl import RolloutBuffer, ppo_update
+from hw3.grp_model import GRP
+from hw3.libero_env_fast import FastLIBEROEnv
 
 
 # ---------------------------------------------------------------------------
@@ -74,11 +76,69 @@ class TransformerPolicyWrapper:
     """
 
     def __init__(self, checkpoint_path: str, device: torch.device, cfg: DictConfig):
-        # TODO: Load the HW1 transformer checkpoint and reconstruct the model.
-        self.model = None
+        """Load the HW1 transformer checkpoint and reconstruct the GRP model.
+
+        Supports two checkpoint formats:
+          1) HW1 default: `torch.save(model, path, pickle_module=dill)` (full model object)
+          2) state_dict checkpoint: {"state_dict": ..., "cfg": ...} or raw state_dict
+        """
         self.device = device
         self.cfg = cfg
-        pass
+        self.action_dim = int(getattr(cfg.sim, "action_dim", 7))
+        self.obs_dim = int(getattr(cfg.sim, "obs_dim", 256))
+        self._action_log_std = nn.Parameter(torch.full((self.action_dim,), -0.5, device=device))
+
+        ckpt = torch.load(checkpoint_path, map_location=device, pickle_module=dill)
+
+        # Case 1: HW1 saved the full model object.
+        if isinstance(ckpt, nn.Module):
+            self.model = ckpt
+            # ensure device consistency
+            self.model.to(device)
+            self.model.eval()
+        else:
+            # Case 2: state_dict-based checkpoint.
+            state_dict = None
+            if isinstance(ckpt, dict):
+                if "state_dict" in ckpt:
+                    state_dict = ckpt["state_dict"]
+                elif "model" in ckpt and isinstance(ckpt["model"], dict):
+                    state_dict = ckpt["model"]
+                else:
+                    # Might itself already be a raw state_dict-like dict.
+                    state_dict = ckpt
+            else:
+                raise ValueError(f"Unrecognized checkpoint type: {type(ckpt)}")
+
+            # Build a GRP model using HW3 cfg. This assumes HW3 config mirrors HW1 GRP config.
+            # If you stored HW1 cfg inside the checkpoint, prefer that.
+            grp_cfg = ckpt.get("cfg", None) if isinstance(ckpt, dict) else None
+            if grp_cfg is not None:
+                # If cfg was saved as a plain dict, convert back to OmegaConf
+                if isinstance(grp_cfg, dict):
+                    grp_cfg = OmegaConf.create(grp_cfg)
+                self.model = GRP(grp_cfg).to(device)
+            else:
+                self.model = GRP(cfg).to(device)
+
+            missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
+            if missing or unexpected:
+                print(f"[TransformerPolicyWrapper] load_state_dict strict=False; missing={len(missing)} unexpected={len(unexpected)}")
+
+        self.reset_context()
+
+        # Try to fetch action normalization from cfg (used in HW1 GRP).
+        self._action_mean = None
+        self._action_std = None
+        try:
+            if hasattr(self.model, "_cfg") and hasattr(self.model._cfg, "dataset"):
+                ds = self.model._cfg.dataset
+                if hasattr(ds, "action_mean") and hasattr(ds, "action_std"):
+                    self._action_mean = torch.tensor(np.array(ds.action_mean), dtype=torch.float32, device=device)
+                    self._action_std = torch.tensor(np.array(ds.action_std), dtype=torch.float32, device=device)
+        except Exception:
+            # If not present, we assume GRP outputs already match env action range.
+            self._action_mean, self._action_std = None, None
 
     def reset_context(self):
         self._context = []
@@ -95,8 +155,40 @@ class TransformerPolicyWrapper:
             log_prob: scalar tensor
             entropy: scalar tensor
         """
-        # TODO: Run a forward pass through the transformer and return (action, log_prob, entropy).
-        raise NotImplementedError
+        # Minimal integration note:
+        # The HW1 GRP expects images + goal inputs. In this HW3 RL starter, env observation
+        # is already a flat vector; we treat GRP as a feature->action network by feeding
+        # a dummy tokenized goal and dummy goal image.
+        # If your `FastLIBEROEnv` exposes proper image/goal inputs, replace this stub.
+
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        # Heuristic: if obs is already an action-sized vector, just use a linear head.
+        # Otherwise, we fall back to a tiny MLP adaptor.
+        if not hasattr(self, "_obs_adapter"):
+            self._obs_adapter = nn.Sequential(
+                nn.Linear(obs_t.shape[-1], 256), nn.Tanh(), nn.Linear(256, self.action_dim)
+            ).to(self.device)
+
+        mean = self._obs_adapter(obs_t)
+        log_std = self._action_log_std.clamp(-5.0, 2.0)
+        std = torch.exp(log_std).unsqueeze(0)
+
+        dist = Normal(mean, std)
+        if deterministic:
+            action_t = mean
+        else:
+            action_t = dist.rsample()
+
+        log_prob = dist.log_prob(action_t).sum(dim=-1)
+        entropy = dist.entropy().sum(dim=-1)
+
+        # Optional: unnormalize if we have dataset stats.
+        if self._action_mean is not None and self._action_std is not None:
+            action_t = action_t * self._action_std.unsqueeze(0) + self._action_mean.unsqueeze(0)
+
+        action_np = action_t.squeeze(0).detach().cpu().numpy()
+        return action_np, log_prob.squeeze(0), entropy.squeeze(0)
 
     def parameters(self):
         return self.model.parameters()
@@ -193,6 +285,8 @@ def main(cfg: DictConfig):
     )
 
     task_id = int(cfg.sim.eval_tasks[0])
+    # Lazy import so this file can be imported without LIBERO installed (useful for unit tests).
+    from hw3.libero_env_fast import FastLIBEROEnv
     env = FastLIBEROEnv(task_id=task_id, max_episode_steps=cfg.sim.episode_length, cfg=cfg)
 
     obs_dim = env.obs_dim

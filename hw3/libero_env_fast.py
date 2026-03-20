@@ -31,6 +31,9 @@ class FastLIBEROEnv:
         self.current_step = 0
         self.prev_bowl_pos = None
         self.prev_bowl_rel = None
+        # Persistent "holding" estimate used by shaped reward to avoid gating flicker.
+        self._hold_conf = 0.0
+        self._prev_bowl_pos_world = None
         self.render_mode = render_mode
         self._num_settle_steps = 10
 
@@ -198,6 +201,160 @@ class FastLIBEROEnv:
         }
 
         return reward, reward_info
+    
+    def _new_reward(self, state, action):
+        """Reusable reward function from action + observation vector.
+
+        Expects the same layout as _get_obs:
+            [qpos(7), bowl_rel_to_gripper(3), plate_rel_to_gripper(3), ...padding]
+        """
+        # -----------------------------
+        # Dense staged reward design
+        # -----------------------------
+        # Intuition:
+        #   1) Always encourage reaching the bowl (eef -> bowl).
+        #   2) Once the gripper is close enough to plausibly control the bowl,
+        #      shift emphasis to placing (bowl -> plate) with XY alignment + height.
+        #   3) Add a small action penalty for stability.
+        #
+        # This avoids the common local optimum "hover near bowl forever" and makes
+        # the task decomposition (reach -> transport -> place) explicit.
+
+        # From observation vector: bowl position is encoded as (bowl_pos - eef_pos)
+        eef_pos = state[:3].astype(np.float32)
+        gripper_qpos = float(state[6])
+        bowl_rel = state[7:10].astype(np.float32)
+        d_gb = float(np.linalg.norm(bowl_rel))  # distance gripper->bowl
+
+        # Get world positions for bowl/plate for a proper place reward.
+        sim = self.env.sim
+        try:
+            bowl_body = sim.model.body_name2id(self.target_objects[0])
+            plate_body = sim.model.body_name2id(self.target_objects[1])
+            bowl_pos = np.asarray(sim.data.body_xpos[bowl_body], dtype=np.float32)
+            plate_pos = np.asarray(sim.data.body_xpos[plate_body], dtype=np.float32)
+        except Exception:
+            # Fallback to observation-only; place shaping will degrade gracefully.
+            bowl_pos = None
+            plate_pos = None
+
+        # --- Reach term (smooth, dense) ---
+        # exp(-k * d) gives strong gradient when close and still informative far away.
+        k_reach = 10.0
+        r_reach = float(np.exp(-k_reach * d_gb))
+
+        # --- Place terms (XY + height) ---
+        # Use XY alignment and a target height slightly above plate surface.
+        if bowl_pos is not None and plate_pos is not None:
+            bowl_minus_plate = bowl_pos - plate_pos
+            d_bp_xy = float(np.linalg.norm(bowl_minus_plate[:2]))
+
+            # Target: bowl should end up just above plate height; 2cm is a forgiving shim.
+            z_target = float(plate_pos[2] + 0.02)
+            d_bp_z = float(abs(bowl_pos[2] - z_target))
+        else:
+            # If we can't access MuJoCo bodies, fall back to gripper->plate (weaker proxy).
+            plate_rel = state[10:13].astype(np.float32)
+            d_bp_xy = float(np.linalg.norm(plate_rel[:2]))
+            d_bp_z = float(abs(plate_rel[2]))
+
+        k_xy = 15.0
+        k_z = 20.0
+        r_place_xy = float(np.exp(-k_xy * d_bp_xy))
+        r_place_z = float(np.exp(-k_z * d_bp_z))
+
+        # --- Grip / hold shaping to prevent "flicker" ---
+        # If we gate placing purely on distance-to-bowl, the agent can oscillate:
+        # reach bowl -> gate on -> move away without grasp -> gate off -> repeat.
+        #
+        # We instead build a holding confidence that increases when (a) close to bowl,
+        # (b) gripper is closed (proxy), and (c) bowl is moving (proxy for contact).
+        reach_eps = 0.06  # 6cm
+        g_reach = float(np.clip((reach_eps - d_gb) / max(reach_eps, 1e-6), 0.0, 1.0))
+
+        # Gripper closure proxy.
+        # Convention is env-dependent; in many robosuite variants smaller qpos ~= more closed.
+        close_lo, close_hi = 0.01, 0.04
+        g_close = float(np.clip((close_hi - gripper_qpos) / max(close_hi - close_lo, 1e-6), 0.0, 1.0))
+
+        # Bowl-follow proxy (movement indicates interaction).
+        bowl_follow = 0.0
+        if bowl_pos is not None:
+            if self._prev_bowl_pos_world is None:
+                self._prev_bowl_pos_world = bowl_pos.copy()
+            bowl_delta = bowl_pos - self._prev_bowl_pos_world
+            bowl_move = float(np.linalg.norm(bowl_delta))
+            # Map 0..2cm to 0..1
+            bowl_follow = float(np.clip(bowl_move / 0.02, 0.0, 1.0))
+            self._prev_bowl_pos_world = bowl_pos.copy()
+
+        # Instantaneous grasp score (0..1)
+        grasp_score = g_reach * (0.6 * g_close + 0.4 * bowl_follow)
+
+        # Persistent hold confidence (EMA with slower decay than growth).
+        alpha_up, alpha_down = 0.2, 0.05
+        if grasp_score > self._hold_conf:
+            self._hold_conf = (1.0 - alpha_up) * self._hold_conf + alpha_up * grasp_score
+        else:
+            self._hold_conf = (1.0 - alpha_down) * self._hold_conf + alpha_down * grasp_score
+
+        # Hysteresis: treat hold_gate as the "mode" for placing.
+        hold_on, hold_off = 0.55, 0.35
+        if self._hold_conf >= hold_on:
+            hold_gate = 1.0
+        elif self._hold_conf <= hold_off:
+            hold_gate = 0.0
+        else:
+            hold_gate = float(np.clip((self._hold_conf - hold_off) / max(hold_on - hold_off, 1e-6), 0.0, 1.0))
+
+        # Gate placing on "likely holding" instead of purely distance.
+        g = float(hold_gate)
+
+        # --- Control penalty (small) ---
+        action = np.asarray(action, dtype=np.float32)
+        act_pen = float(np.sum(action * action))
+        r_act = -0.001 * act_pen
+
+        # --- Explicit grasp/hold shaping ---
+        r_grasp = float(grasp_score)
+        r_hold = float(self._hold_conf)
+
+        # --- Weighted sum ---
+        w_reach = 1.0
+        w_place_xy = 1.0
+        w_place_z = 0.5
+        w_grasp = 0.3
+        w_hold = 0.2
+        reward = (
+            (w_reach * (1.0 - g) * r_reach)
+            + (w_grasp * r_grasp)
+            + (w_hold * r_hold)
+            + (g * (w_place_xy * r_place_xy + w_place_z * r_place_z))
+            + r_act
+        )
+
+        reward_info = {
+            # distances / gate
+            "d_gripper_bowl": d_gb,
+            "d_bowl_plate_xy": d_bp_xy,
+            "d_bowl_plate_z": d_bp_z,
+            "gate_place": g,
+            "gate_reach": float(g_reach),
+            "gate_close": float(g_close),
+            "bowl_follow": float(bowl_follow),
+            "hold_conf": float(self._hold_conf),
+            # components
+            "reward_reach": r_reach,
+            "reward_place_xy": r_place_xy,
+            "reward_place_z": r_place_z,
+            "reward_grasp": float(r_grasp),
+            "reward_hold": float(r_hold),
+            "reward_action_pen": r_act,
+            # total
+            "reward_total": float(reward),
+        }
+
+        return float(reward), reward_info
 
     def _compute_reward(self, action, state=None):
         """Dense reward computed from the same vector returned by _get_obs."""
@@ -239,6 +396,15 @@ class FastLIBEROEnv:
         state = self._get_state_obs(obs_dict)
         # Update previous bowl-relative position for next step
         self.prev_bowl_rel = state[7:10].copy()
+
+        # Reset hold tracking.
+        self._hold_conf = 0.0
+        try:
+            sim = self.env.sim
+            bowl_pos = sim.data.body_xpos[sim.model.body_name2id(self.target_objects[0])]
+            self._prev_bowl_pos_world = np.asarray(bowl_pos, dtype=np.float32).copy()
+        except Exception:
+            self._prev_bowl_pos_world = None
 
         obs = self._get_image_obs() if self.output_image_obs else state
         info = {"state_obs": state.copy()}
