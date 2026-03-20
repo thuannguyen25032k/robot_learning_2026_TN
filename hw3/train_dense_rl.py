@@ -225,8 +225,8 @@ def ppo_update(policy: DensePolicy,
     returns = returns.detach()
     advantages = advantages.detach()
 
-    # PPO commonly normalizes advantages per update batch.
-    advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+    # # PPO commonly normalizes advantages per update batch.
+    # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
     n = obs.shape[0]
     mb = int(cfg.training.minibatch_size)
@@ -239,7 +239,9 @@ def ppo_update(policy: DensePolicy,
     clip_eps = float(getattr(cfg.training, "clip_epsilon", getattr(cfg.training, "clip_eps")))
     value_coef = float(getattr(cfg.training, "value_coef", getattr(cfg.training, "value_coeff")))
     entropy_coef = float(getattr(cfg.training, "entropy_coef", getattr(cfg.training, "entropy_coeff")))
-    max_grad_norm = float(getattr(cfg.training, "max_grad_norm", 0.0))
+    max_grad_norm = float(getattr(cfg.training, "max_grad_norm", 0.5))
+    # Recommended target_kl: 0.01 to 0.015 for stability
+    target_kl = float(getattr(cfg.training, "target_kl", 0.0))
 
     # For logging
     policy_losses = []
@@ -249,54 +251,70 @@ def ppo_update(policy: DensePolicy,
     clip_fracs = []
 
     for _epoch in range(int(cfg.training.ppo_epochs)):
+        epoch_kls = [] # Track KLs for this specific epoch
         perm = torch.randperm(n, device=obs.device)
         for start in range(0, n, mb):
             idx = perm[start:start + mb]
 
-            mb_obs = obs[idx]
-            mb_actions = actions[idx]
-            mb_old_logp = old_log_probs[idx]
-            mb_returns = returns[idx]
+            # 1. Minibatch Advantage Normalization
             mb_adv = advantages[idx]
-
-            dist = policy(mb_obs)
-            new_logp = dist.log_prob(mb_actions).sum(-1)
-            entropy = dist.entropy().sum(-1).mean()
-
-            values_pred = value_fn(mb_obs)
-
-            # Ratio for clipped surrogate objective.
-            log_ratio = new_logp - mb_old_logp
-            ratio = torch.exp(log_ratio)
-
+            mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+            
+            # 2. Re-calculate distribution and values
+            dist = policy(obs[idx])
+            new_logp = dist.log_prob(actions[idx]).sum(-1)
+            values_pred = value_fn(obs[idx])
+            mb_old_logp = old_log_probs[idx]
+            
+            # 3. Clip the value to reduce variability during Critic training and compute value loss.
+            # 3.a. Get the value from the rollout (stored in buffer)
+            mb_old_values = buffer.values[idx]
+            # 3.b. Calculate the "unclipped" loss
+            mb_returns = returns[idx]
+            value_loss_unclipped = (values_pred - mb_returns)**2
+            # 3.c. Calculate the "clipped" loss
+            values_clipped = mb_old_values + torch.clamp(values_pred - mb_old_values,-clip_eps,clip_eps)
+            value_loss_clipped = (values_clipped - mb_returns)**2
+            # 3.d. Take the maximum of the two (pessimistic bound)
+            v_loss_max = torch.max(value_loss_unclipped, value_loss_clipped)
+            value_loss = 0.5 * v_loss_max.mean()
+            
+            # 4. Policy loss with clipped surrogate objective.
+            ratio = torch.exp(new_logp - mb_old_logp)
             surr1 = ratio * mb_adv
             surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * mb_adv
             policy_loss = -torch.min(surr1, surr2).mean()
-
-            # Value function loss (simple MSE).
-            value_loss = 0.5 * F.mse_loss(values_pred, mb_returns)
-
+            
+            # 5. Entropy bonus for exploration
+            entropy = dist.entropy().sum(-1).mean()
+            
+            # 6. Total loss
             loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            if max_grad_norm and max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    list(policy.parameters()) + list(value_fn.parameters()),
-                    max_grad_norm,
-                )
+            nn.utils.clip_grad_norm_(list(policy.parameters()) + list(value_fn.parameters()), max_grad_norm)
             optimizer.step()
 
             # Logging stats
             with torch.no_grad():
-                approx_kl = (mb_old_logp - new_logp).mean()
+                log_ratio = new_logp - mb_old_logp
+                approx_kl = 0.5 * (log_ratio**2).mean() # The one you found
+                
+                # Your clipfrac is already perfect
                 clipped = (torch.abs(ratio - 1.0) > clip_eps).float().mean()
-
+                epoch_kls.append(approx_kl.item())
             policy_losses.append(policy_loss.detach())
             value_losses.append(value_loss.detach())
             entropies.append(entropy.detach())
             approx_kls.append(approx_kl.detach())
             clip_fracs.append(clipped.detach())
+        # --- Check for Early Stopping after the epoch's minibatches ---
+        if target_kl > 0.0:  # Only check if target_kl is set to a positive value
+            avg_epoch_kl = np.mean(epoch_kls)
+            if avg_epoch_kl > target_kl:
+                print(f"Early stopping at epoch {_epoch} due to reaching target KL: {avg_epoch_kl:.4f} > {target_kl}")
+                break
 
     def _mean(xs):
         if not xs:
@@ -406,6 +424,10 @@ def main(cfg: DictConfig):
         returns, advantages = buffer.compute_returns_and_advantages(
             last_value, cfg.training.gamma, cfg.training.gae_lambda
         )
+        # Annealing the rate if instructed to do so.
+        if cfg.training.anneal_lr:
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = cfg.training.learning_rate * (1 - total_steps / cfg.training.total_env_steps)
 
         # PPO update
         update_info = ppo_update(policy, value_fn, optimizer, buffer, returns, advantages, cfg)

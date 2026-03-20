@@ -313,7 +313,7 @@ class FastLIBEROEnv:
         # --- Control penalty (small) ---
         action = np.asarray(action, dtype=np.float32)
         act_pen = float(np.sum(action * action))
-        r_act = -0.001 * act_pen
+        r_act = -0.01 * act_pen
 
         # --- Explicit grasp/hold shaping ---
         r_grasp = float(grasp_score)
