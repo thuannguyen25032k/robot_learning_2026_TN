@@ -16,21 +16,25 @@ sim:
   eval_episodes: 5
   episode_length: 300
   use_fast_env: true
+  fast_env_output_image: true
+  reward_version: "ver2"  # options: "ver1", "ver2", "ver3", "standard"
 
 training:
-  total_env_steps: 200000
-  rollout_length: 128
+  total_env_steps: 2000000
+  rollout_length: 2048       # steps collected per update
   ppo_epochs: 10
-  minibatch_size: 64         # smaller for transformer memory
+  minibatch_size: 256         # smaller for transformer memory
   gamma: 0.99
   gae_lambda: 0.95
   clip_eps: 0.2
   value_coeff: 0.5
-  entropy_coeff: 0.01
+  entropy_coeff: 0.015
   max_grad_norm: 0.5
   learning_rate: 1e-5        # smaller LR for fine-tuning
   normalize_advantages: true
   normalize_rewards: false
+  anneal_lr: true
+  target_kl: 0             # KL divergence threshold for early stopping (0 to disable)
 
 grpo:
   group_size: 8              # number of trajectories per initial state
@@ -40,6 +44,7 @@ value:
   hidden_dim: 256
   n_layers: 2
   learning_rate: 3e-4
+  shared_network: false
 
 eval_interval: 10000
 log_interval: 1000

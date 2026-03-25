@@ -451,7 +451,8 @@ def eval_libero_fast(model, device, cfg, iter_=0, log_dir="./",
     task_suite = benchmark_dict[task_suite_name]()
     trajectory_data = []
     last_video_path = None
-    tasks = cfg.sim.eval_tasks
+    tasks = [cfg.sim.eval_tasks[0] for _ in range(10)]
+    successful_tasks = 0
     for task_id in tasks:
         env = FastLIBEROEnv(
             benchmark_name=task_suite_name,
@@ -523,6 +524,7 @@ def eval_libero_fast(model, device, cfg, iter_=0, log_dir="./",
                             frames.append(frame)
                     t += 1
                     if done or truncated:
+                        successful_tasks += 1 if done else 0
                         break
 
             path_ = None

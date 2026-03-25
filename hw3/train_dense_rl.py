@@ -28,12 +28,10 @@ if _LIBERO_ROOT.exists():
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.distributions import Normal
 import hydra
 from omegaconf import DictConfig, OmegaConf
 import wandb
-
 from hw3.libero_env_fast import FastLIBEROEnv
 
 
@@ -46,7 +44,7 @@ class DensePolicy(nn.Module):
     MLP policy that maps privileged state observations to action distributions.
     Outputs a Gaussian distribution (mean + log_std) over the 7-DoF action space.
     """
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 256, n_layers: int = 3):
+    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 256, n_layers: int = 5):
         super().__init__()
         if n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
@@ -72,43 +70,68 @@ class DensePolicy(nn.Module):
         # PPO-friendly default: state-independent log std (one per action dim).
         # This is widely used and tends to be more stable than predicting std from obs.
         self.log_std = nn.Parameter(torch.zeros(action_dim))
-        self.tanh = nn.Tanh() 
-
+        # nn.init.constant_(self.log_std, -0.5)  # Start with std ~ exp(-0.5) ~ 0.6 for reasonable initial exploration.
         # Numerical safety bounds for std; can be overridden later if needed.
         self.log_std_min = -5.0
-        self.log_std_max = 2.0
+        self.log_std_max = 1.0
 
     def forward(self, obs: torch.Tensor):
         """
         Args:
             obs: (B, obs_dim) float tensor
         Returns:
-            dist: torch.distributions.Normal over actions
+            dist: torch.distributions.Normal over the pre-tanh Gaussian (used for log_prob)
         """
         h = self.net(obs)
-        mean = self.mean_head(h)
+        mean = self.mean_head(h)   # unbounded pre-tanh mean
 
         # Expand (action_dim,) -> (B, action_dim) without allocating new storage.
         log_std = self.log_std.clamp(self.log_std_min, self.log_std_max)
         std = log_std.exp().expand_as(mean)
+        # Return the base Gaussian. tanh squashing + log-prob correction is handled
+        # in get_action() and ppo_update() via _tanh_log_prob().
         return Normal(mean, std)
 
+    @staticmethod
+    def _tanh_log_prob(dist: Normal, pre_tanh_action: torch.Tensor) -> torch.Tensor:
+        """Log-prob of a tanh-squashed action with Jacobian correction.
+
+        For action = tanh(u), u ~ Normal:
+            log π(a) = log p(u) - sum log(1 - tanh²(u))
+        This is the standard SAC/PPO-with-tanh correction.
+        """
+        log_prob = dist.log_prob(pre_tanh_action).sum(-1)
+        # Jacobian correction: -sum log(1 - tanh(u)^2) = -sum log(sech^2(u))
+        # Numerically stable form: 2*(log2 - u - softplus(-2u))
+        correction = 2.0 * (
+            torch.log(torch.tensor(2.0, device=pre_tanh_action.device))
+            - pre_tanh_action
+            - torch.nn.functional.softplus(-2.0 * pre_tanh_action)
+        ).sum(-1)
+        return log_prob - correction
+
     def get_action(self, obs: torch.Tensor, deterministic: bool = False):
-        """Sample an action and return (action, log_prob, entropy)."""
+        """Sample a tanh-squashed action and return (action_np, log_prob, entropy).
+
+        The pre-tanh sample u is stored in the buffer (via the action field),
+        so that ppo_update can recompute log_prob(tanh(u)) consistently.
+        """
         dist = self.forward(obs)
         if deterministic:
-            action = dist.mean
+            pre_tanh = dist.mean
         else:
-            action = dist.rsample()
-        action = action.clamp(-1.0, 1.0)
-        log_prob = dist.log_prob(action).sum(-1)
-        entropy = dist.entropy().sum(-1)
-        return action, log_prob, entropy
+            pre_tanh = dist.rsample()
+        log_prob = self._tanh_log_prob(dist, pre_tanh)
+        entropy  = dist.entropy().sum(-1)
+        action   = torch.tanh(pre_tanh)          # squash to (-1, 1)
+        # Return the PRE-TANH sample so the buffer stores it — allows exact
+        # log_prob recomputation in ppo_update without any clamp distortion.
+        return action.squeeze(0).detach().cpu().numpy(), log_prob.squeeze(0), entropy.squeeze(0), pre_tanh.squeeze(0)
 
 
 class DenseValueFunction(nn.Module):
     """MLP value function V(s) for PPO critic."""
-    def __init__(self, obs_dim: int, hidden_dim: int = 256, n_layers: int = 3):
+    def __init__(self, obs_dim: int, hidden_dim: int = 256, n_layers: int = 5):
         super().__init__()
         if n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {n_layers}")
@@ -144,10 +167,16 @@ class DenseValueFunction(nn.Module):
 class RolloutBuffer:
     """Stores a fixed-length on-policy rollout for PPO updates."""
 
-    def __init__(self, rollout_length: int, obs_dim: int, action_dim: int, device: torch.device):
+    def __init__(self, rollout_length: int, obs_dim: int | tuple, action_dim: int, device: torch.device):
         self.rollout_length = rollout_length
         self.device = device
-        self.obs = torch.zeros(rollout_length, obs_dim, device=device)
+        # Support both vector observations (obs_dim=int) and image observations (obs_dim=tuple like (C,H,W) or (H,W,C)).
+        if isinstance(obs_dim, int):
+            obs_shape = (obs_dim,)
+        else:
+            obs_shape = tuple(int(x) for x in obs_dim)
+        self.obs_shape = obs_shape
+        self.obs = torch.zeros((rollout_length, *obs_shape), device=device)
         self.actions = torch.zeros(rollout_length, action_dim, device=device)
         self.log_probs = torch.zeros(rollout_length, device=device)
         self.rewards = torch.zeros(rollout_length, device=device)
@@ -156,7 +185,12 @@ class RolloutBuffer:
         self.ptr = 0
 
     def add(self, obs, action, log_prob, reward, value, done):
-        self.obs[self.ptr] = obs
+        # Allow obs to be numpy or torch, and ensure it matches the buffer shape.
+        if not isinstance(obs, torch.Tensor):
+            obs = torch.as_tensor(obs, dtype=self.obs.dtype, device=self.device)
+        else:
+            obs = obs.to(device=self.device)
+        self.obs[self.ptr].copy_(obs)
         self.actions[self.ptr] = action
         self.log_probs[self.ptr] = log_prob
         self.rewards[self.ptr] = reward
@@ -218,12 +252,20 @@ def ppo_update(policy: DensePolicy,
 
     Returns a dict of mean losses for logging.
     """
+    def _all_finite(module: nn.Module) -> bool:
+        for p in module.parameters():
+            if p is None:
+                continue
+            if not torch.isfinite(p).all():
+                return False
+        return True
+
     # Flatten rollout (T, ...) -> (N, ...)
-    obs = buffer.obs.detach()
-    actions = buffer.actions.detach()
+    obs          = buffer.obs.detach()
+    actions      = buffer.actions.detach()
     old_log_probs = buffer.log_probs.detach()
-    returns = returns.detach()
-    advantages = advantages.detach()
+    returns      = returns.detach()
+    advantages   = advantages.detach()
 
     # # PPO commonly normalizes advantages per update batch.
     # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -240,6 +282,9 @@ def ppo_update(policy: DensePolicy,
     value_coef = float(getattr(cfg.training, "value_coef", getattr(cfg.training, "value_coeff")))
     entropy_coef = float(getattr(cfg.training, "entropy_coef", getattr(cfg.training, "entropy_coeff")))
     max_grad_norm = float(getattr(cfg.training, "max_grad_norm", 0.5))
+    # Value clipping uses a separate, larger epsilon than the policy clip.
+    # Value targets can be in the hundreds; policy clip_eps (0.2) would freeze the critic.
+    value_clip_eps = float(getattr(cfg.training, "value_clip_eps", 10.0))
     # Recommended target_kl: 0.01 to 0.015 for stability
     target_kl = float(getattr(cfg.training, "target_kl", 0.0))
 
@@ -258,11 +303,15 @@ def ppo_update(policy: DensePolicy,
 
             # 1. Minibatch Advantage Normalization
             mb_adv = advantages[idx]
-            mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
+            mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std(unbiased=False) + 1e-8)
             
             # 2. Re-calculate distribution and values
-            dist = policy(obs[idx])
-            new_logp = dist.log_prob(actions[idx]).sum(-1)
+            # actions[idx] are the pre-tanh samples stored in the buffer.
+            # Recompute the tanh-corrected log-prob so the importance ratio is exact.
+            # Call via the policy instance so this works for both DensePolicy and
+            # TransformerPolicyWrapper (both have _tanh_log_prob as a static method).
+            dist = policy.forward(obs[idx])
+            new_logp = policy._tanh_log_prob(dist, actions[idx])
             values_pred = value_fn(obs[idx])
             mb_old_logp = old_log_probs[idx]
             
@@ -272,8 +321,10 @@ def ppo_update(policy: DensePolicy,
             # 3.b. Calculate the "unclipped" loss
             mb_returns = returns[idx]
             value_loss_unclipped = (values_pred - mb_returns)**2
-            # 3.c. Calculate the "clipped" loss
-            values_clipped = mb_old_values + torch.clamp(values_pred - mb_old_values,-clip_eps,clip_eps)
+            # 3.c. Calculate the "clipped" loss — use value_clip_eps, NOT policy clip_eps.
+            # Policy clip_eps (0.2) is far too small for value targets in the range [0, ~2700];
+            # it would freeze the critic. value_clip_eps defaults to 10.0.
+            values_clipped = mb_old_values + torch.clamp(values_pred - mb_old_values, -value_clip_eps, value_clip_eps)
             value_loss_clipped = (values_clipped - mb_returns)**2
             # 3.d. Take the maximum of the two (pessimistic bound)
             v_loss_max = torch.max(value_loss_unclipped, value_loss_clipped)
@@ -293,16 +344,33 @@ def ppo_update(policy: DensePolicy,
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+
+            # Abort-like behavior if gradients explode to NaN/Inf.
+            grads_finite = True
+            for p in list(policy.parameters()) + list(value_fn.parameters()):
+                if p.grad is None:
+                    continue
+                if not torch.isfinite(p.grad).all():
+                    grads_finite = False
+                    break
+
+            if not grads_finite:
+                print("[ppo_update] Non-finite gradients detected; skipping optimizer step for this minibatch.")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             nn.utils.clip_grad_norm_(list(policy.parameters()) + list(value_fn.parameters()), max_grad_norm)
             optimizer.step()
 
+            # If params become non-finite (rare but possible), stop early to prevent poisoning the run.
+            if not _all_finite(policy) or not _all_finite(value_fn):
+                raise FloatingPointError("Non-finite parameters detected after optimizer step.")
+
             # Logging stats
             with torch.no_grad():
-                log_ratio = new_logp - mb_old_logp
-                approx_kl = 0.5 * (log_ratio**2).mean() # The one you found
-                
-                # Your clipfrac is already perfect
-                clipped = (torch.abs(ratio - 1.0) > clip_eps).float().mean()
+                # Approximate KL: E[log π_old - log π_new]  (reverse KL, matches OpenAI baselines)
+                approx_kl = (mb_old_logp - new_logp).mean()
+                clipped    = (torch.abs(ratio - 1.0) > clip_eps).float().mean()
                 epoch_kls.append(approx_kl.item())
             policy_losses.append(policy_loss.detach())
             value_losses.append(value_loss.detach())
@@ -331,6 +399,133 @@ def ppo_update(policy: DensePolicy,
 
 
 # ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+def evaluate_policy(
+    policy: DensePolicy,
+    eval_env: "FastLIBEROEnv",
+    cfg: DictConfig,
+    device: torch.device,
+    total_steps: int,
+    log_dir: str,
+) -> dict:
+    """Run deterministic evaluation episodes and log metrics + a video to W&B.
+
+    One video is captured from the episode with the **highest success rate**
+    (ties broken by lowest episode index, i.e. the first episode wins).
+    Metrics are averaged over all ``cfg.sim.eval_episodes`` episodes and
+    returned as a plain dict (keys: ``eval/success_rate``,
+    ``eval/avg_reward``, ``eval/avg_episode_length``).
+
+    Args:
+        policy:      The policy network to evaluate (set to eval mode internally).
+        eval_env:    A ``FastLIBEROEnv`` instantiated with ``render_mode='rgb_array'``
+                     so that ``render()`` returns frames.
+        cfg:         Hydra config (uses ``cfg.sim.eval_episodes``,
+                     ``cfg.sim.episode_length``).
+        device:      Torch device.
+        total_steps: Current training step count (used as W&B x-axis).
+        log_dir:     Hydra output directory; videos are saved there before upload.
+
+    Returns:
+        dict with scalar metrics (all under the ``eval/`` prefix).
+    """
+    n_episodes    = int(cfg.sim.eval_episodes)
+    max_ep_steps  = int(cfg.sim.episode_length)
+    video_fps     = int(getattr(cfg.sim, "video_fps", 20))
+    cam_name      = str(getattr(cfg.sim, "fast_env_image_camera", "agentview"))
+    render_size   = int(getattr(cfg.sim, "fast_env_image_size", 256))
+
+    ep_returns    : list[float]             = []
+    ep_lengths    : list[int]               = []
+    ep_successes  : list[float]             = []
+    all_ep_frames : list[list[np.ndarray]]  = []   # one list of frames per episode
+
+    was_training = policy.training
+    policy.eval()
+
+    with torch.no_grad():
+        for _ in range(n_episodes):
+            obs, _ = eval_env.reset()
+            ep_return = 0.0
+            ep_length = 0
+            success   = 0.0
+            ep_frames : list[np.ndarray] = []
+
+            for _ in range(max_ep_steps):
+                # Deterministic action (use mean of the Gaussian)
+                obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                action_np, _, _, _ = policy.get_action(obs_t, deterministic=True)
+
+                obs, reward, done, truncated, info = eval_env.step(action_np)
+
+                ep_return += float(reward)
+                ep_length += 1
+
+                frame = eval_env.render(camera_name=cam_name, width=render_size, height=render_size)
+                if frame is not None:
+                    ep_frames.append(frame)
+
+                if done or truncated:
+                    success = float(info.get("success_placed", 0.0))
+                    break
+
+            ep_returns.append(ep_return)
+            ep_lengths.append(ep_length)
+            ep_successes.append(success)
+            all_ep_frames.append(ep_frames)
+
+    policy.train(was_training)
+
+    # ---- Pick the best episode for video (highest success; first episode on tie) ----
+    best_idx = int(np.argmax(ep_successes))   # argmax returns the *first* max index
+    video_frames = all_ep_frames[best_idx]
+
+    # ---- Scalar metrics ----
+    metrics = {
+        "eval/success_rate":        float(np.mean(ep_successes)),
+        "eval/avg_reward":          float(np.mean(ep_returns)),
+        "eval/avg_episode_length":  float(np.mean(ep_lengths)),
+    }
+
+    # ---- Video logging (best episode) ----
+    if video_frames:
+        # video_frames: list of (H, W, 3) uint8 arrays
+        # wandb.Video expects (T, C, H, W) when passing a numpy array
+        video_array = np.stack(video_frames, axis=0)          # (T, H, W, 3)
+        video_array = video_array.transpose(0, 3, 1, 2)       # (T, 3, H, W)
+
+        # Also save a local mp4 for reference
+        video_dir = os.path.join(log_dir, "videos")
+        os.makedirs(video_dir, exist_ok=True)
+        video_path = os.path.join(video_dir, f"eval_{total_steps:07d}.mp4")
+        try:
+            import imageio
+            imageio.mimwrite(
+                video_path,
+                [f.transpose(1, 2, 0) for f in video_array],  # back to (H, W, C) per frame
+                fps=video_fps,
+                codec="libx264",
+                quality=7,
+            )
+            metrics["eval/video"] = wandb.Video(video_path, fps=video_fps, format="mp4")
+        except Exception as e:
+            # imageio not available or codec missing — fall back to raw wandb.Video from array
+            print(f"[eval] mp4 save failed ({e}); uploading raw frames to W&B.")
+            metrics["eval/video"] = wandb.Video(video_array, fps=video_fps, format="gif")
+
+    print(
+        f"[eval @ {total_steps}] "
+        f"success={metrics['eval/success_rate']:.2f}  "
+        f"avg_reward={metrics['eval/avg_reward']:.3f}  "
+        f"avg_ep_len={metrics['eval/avg_episode_length']:.1f}  "
+        f"video=ep{best_idx} (success={ep_successes[best_idx]:.1f})"
+    )
+    return metrics
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -341,6 +536,7 @@ def main(cfg: DictConfig):
     torch.manual_seed(cfg.r_seed)
     np.random.seed(cfg.r_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
 
     # --- Logging ---
     wandb.init(
@@ -357,6 +553,13 @@ def main(cfg: DictConfig):
         cfg=cfg,
     )
 
+    eval_env = FastLIBEROEnv(
+        task_id=task_id,
+        max_episode_steps=cfg.sim.episode_length,
+        cfg=cfg,
+        render_mode="rgb_array",
+    )
+    
     obs_dim = cfg.policy.obs_dim
     action_dim = cfg.policy.action_dim
 
@@ -374,9 +577,8 @@ def main(cfg: DictConfig):
     # --- Rollout state ---
     obs, _ = env.reset()
     obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device)
-    episode_return = 0.0
-    episode_steps = 0
-    total_steps = 0
+    episode_return  = 0.0
+    total_steps     = 0
     episode_returns = []
     episode_successes = []
 
@@ -387,19 +589,29 @@ def main(cfg: DictConfig):
         # Collect one rollout
         with torch.no_grad():
             for _ in range(cfg.training.rollout_length):
-                action, log_prob, _ = policy.get_action(obs_tensor.unsqueeze(0))
+                # If env ever returns NaNs/Infs, reset to avoid poisoning training.
+                if not torch.isfinite(obs_tensor).all():
+                    print("[train] Non-finite observation detected; resetting env.")
+                    obs, _ = env.reset()
+                    obs_tensor = torch.tensor(obs, dtype=torch.float32, device=device)
+                    episode_return = 0.0
+                    episode_steps = 0
+
+                # get_action returns (action_np, log_prob, entropy, pre_tanh_action).
+                # Store pre_tanh in the buffer so ppo_update can recompute the exact
+                # tanh-corrected log-prob without clamp distortion.
+                action_np, log_prob, _, pre_tanh = policy.get_action(obs_tensor.unsqueeze(0))
                 value = value_fn(obs_tensor.unsqueeze(0))
-                action_np = action.squeeze(0).cpu().numpy()
 
                 next_obs, reward, done, truncated, info = env.step(action_np)
+
                 episode_return += reward
-                episode_steps += 1
                 total_steps += 1
 
                 buffer.add(
                     obs_tensor,
-                    action.squeeze(0),
-                    log_prob.squeeze(0),
+                    pre_tanh.to(device),       # store pre-tanh action for exact log_prob recomputation
+                    log_prob.to(device),
                     torch.tensor(reward, device=device),
                     value.squeeze(0),
                     torch.tensor(float(done or truncated), device=device),
@@ -409,7 +621,6 @@ def main(cfg: DictConfig):
                     episode_returns.append(episode_return)
                     episode_successes.append(float(info.get("success_placed", 0.0)))
                     episode_return = 0.0
-                    episode_steps = 0
                     obs, _ = env.reset()
                 else:
                     obs = next_obs
@@ -446,6 +657,13 @@ def main(cfg: DictConfig):
                   f"return={log_dict.get('train/episode_return', float('nan')):.3f} "
                   f"policy_loss={update_info['policy_loss']:.4f}")
 
+        # Periodic evaluation
+        if total_steps % cfg.eval_interval < cfg.training.rollout_length:
+            eval_metrics = evaluate_policy(
+                policy, eval_env, cfg, device, total_steps, log_dir
+            )
+            wandb.log(eval_metrics, step=total_steps)
+        
         # Checkpoint
         if total_steps % cfg.save_interval < cfg.training.rollout_length:
             ckpt = {
@@ -459,10 +677,18 @@ def main(cfg: DictConfig):
             os.makedirs(os.path.join("checkpoints", cfg.experiment.name), exist_ok=True)
             torch.save(ckpt, os.path.join("checkpoints", cfg.experiment.name, f"dense_ppo_{total_steps}.pth"))
 
+    # Final evaluation
+    print("[train] Running final evaluation...")
+    final_eval_metrics = evaluate_policy(
+        policy, eval_env, cfg, device, total_steps, log_dir
+    )
+    wandb.log(final_eval_metrics, step=total_steps)
+
     # Final save
     torch.save({"policy": policy.state_dict(), "cfg": OmegaConf.to_container(cfg)},
                os.path.join("checkpoints", cfg.experiment.name, "dense_ppo_final.pth"))
     env.close()
+    eval_env.close()
     wandb.finish()
 
 

@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+import math
 
 
 def get_patches_fast(images, cfg):
@@ -16,12 +17,20 @@ def get_patches_fast(images, cfg):
     return patches
 
 
-def calc_positional_embeddings(sequence_length, d):
-    result = torch.ones(sequence_length, d)
-    for i in range(sequence_length):
-        for j in range(d):
-            result[i][j] = np.sin(i / (10000 ** (j / d))) if j % 2 == 0 else np.cos(i / (10000 ** ((j - 1) / d)))
-    return result
+def calc_positional_embeddings(sequence_length, d, device="cpu"):
+    # 1. Create position indices (0, 1, 2..., seq_len-1)
+    position = torch.arange(sequence_length, dtype=torch.float).unsqueeze(1)
+    
+    # 2. Create the division term in log space for better precision
+    # Use 2i as the step (0, 2, 4...)
+    div_term = torch.exp(torch.arange(0, d, 2).float() * (-math.log(10000.0) / d))
+    
+    pe = torch.zeros(sequence_length, d)
+    # 3. Apply sin to even indices (0, 2, 4...) and cos to odd (1, 3, 5...)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    
+    return pe.to(device)
 
 
 class Head(nn.Module):
