@@ -167,7 +167,7 @@ class DenseValueFunction(nn.Module):
 class RolloutBuffer:
     """Stores a fixed-length on-policy rollout for PPO updates."""
 
-    def __init__(self, rollout_length: int, obs_dim: int | tuple, action_dim: int, device: torch.device):
+    def __init__(self, rollout_length: int, obs_dim: int | tuple, action_dim: int, device: torch.device, pose_dim: int = 7):
         self.rollout_length = rollout_length
         self.device = device
         # Support both vector observations (obs_dim=int) and image observations (obs_dim=tuple like (C,H,W) or (H,W,C)).
@@ -178,24 +178,53 @@ class RolloutBuffer:
         self.obs_shape = obs_shape
         self.obs = torch.zeros((rollout_length, *obs_shape), device=device)
         self.actions = torch.zeros(rollout_length, action_dim, device=device)
+        # pose_dim matches the encoded pose embedding dimension from backbone.model.encode_pose()
+        self.poses = torch.zeros(rollout_length, pose_dim, device=device)
         self.log_probs = torch.zeros(rollout_length, device=device)
         self.rewards = torch.zeros(rollout_length, device=device)
         self.values = torch.zeros(rollout_length, device=device)
         self.dones = torch.zeros(rollout_length, device=device)
         self.ptr = 0
+        # Optional: per-step goal image for transformer policies that change goal
+        # conditioning each episode.  Shape (rollout_length, *obs_shape).
+        # Allocated on first use (add() kwarg goal_state != None) so dense policies
+        # pay zero memory cost.
+        self.goal_states: torch.Tensor | None = None
+        # txt_goal is the same across all episodes of one task; store once.
+        self.txt_goal: torch.Tensor | None = None
 
-    def add(self, obs, action, log_prob, reward, value, done):
+    def add(self, obs, action, log_prob, reward, value, done, pose=None,
+            goal_state: torch.Tensor | None = None,
+            txt_goal: torch.Tensor | None = None):
         # Allow obs to be numpy or torch, and ensure it matches the buffer shape.
         if not isinstance(obs, torch.Tensor):
             obs = torch.as_tensor(obs, dtype=self.obs.dtype, device=self.device)
         else:
             obs = obs.to(device=self.device)
+
+        if pose is not None:
+            pose = torch.as_tensor(pose, dtype=self.poses.dtype, device=self.device)
+        self.poses[self.ptr] = pose
         self.obs[self.ptr].copy_(obs)
         self.actions[self.ptr] = action
         self.log_probs[self.ptr] = log_prob
         self.rewards[self.ptr] = reward
         self.values[self.ptr] = value
         self.dones[self.ptr] = done
+
+        # Store per-step goal image for transformer policies (lazy allocation).
+        if goal_state is not None:
+            if self.goal_states is None:
+                self.goal_states = torch.zeros(
+                    (self.rollout_length, *self.obs_shape), dtype=torch.float32, device=self.device
+                )
+            self.goal_states[self.ptr].copy_(
+                goal_state.to(self.device).squeeze(0) if goal_state.dim() == 4 else goal_state.to(self.device)
+            )
+        if txt_goal is not None:
+            # Only update on first call or on episode transitions — always keep fresh.
+            self.txt_goal = txt_goal.to(self.device)
+
         self.ptr += 1
 
     def full(self):
@@ -203,6 +232,8 @@ class RolloutBuffer:
 
     def reset(self):
         self.ptr = 0
+        self.goal_states = None
+        self.txt_goal    = None
 
     def compute_returns_and_advantages(self, last_value: torch.Tensor, gamma: float, gae_lambda: float):
         """
@@ -263,9 +294,16 @@ def ppo_update(policy: DensePolicy,
     # Flatten rollout (T, ...) -> (N, ...)
     obs          = buffer.obs.detach()
     actions      = buffer.actions.detach()
+    poses        = buffer.poses.detach() if buffer.poses is not None else None
     old_log_probs = buffer.log_probs.detach()
     returns      = returns.detach()
     advantages   = advantages.detach()
+    # Per-step goal conditioning stored by transformer policies (None for dense).
+    goal_states  = buffer.goal_states.detach() if buffer.goal_states is not None else None
+    txt_goal_buf = buffer.txt_goal.detach()     if buffer.txt_goal    is not None else None
+    # Detect whether the policy supports explicit goal arguments
+    # (TransformerPolicyWrapper.forward accepts txt_goal and goal_state).
+    is_transformer_policy = hasattr(policy, "encode_goals")
 
     # # PPO commonly normalizes advantages per update batch.
     # advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -304,15 +342,35 @@ def ppo_update(policy: DensePolicy,
             # 1. Minibatch Advantage Normalization
             mb_adv = advantages[idx]
             mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std(unbiased=False) + 1e-8)
-            
+
+            # 1b. For transformer policies: pass explicit per-step goal conditioning.
+            # goal_states[idx] picks the goal_state stored at each rollout step.
+            # Since GRP forward is batched, we use the last step's goal as a proxy
+            # (correct for single-task setups where txt_goal never changes and
+            # goal_state only changes ~6 times per rollout).
+            if is_transformer_policy and goal_states is not None:
+                mb_goal_state = goal_states[idx[-1]].unsqueeze(0)   # (1, H, W, C)
+                mb_txt_goal   = txt_goal_buf                         # (1, T, ...)
+            else:
+                mb_goal_state = None
+                mb_txt_goal   = None
+
             # 2. Re-calculate distribution and values
-            # actions[idx] are the pre-tanh samples stored in the buffer.
-            # Recompute the tanh-corrected log-prob so the importance ratio is exact.
-            # Call via the policy instance so this works for both DensePolicy and
-            # TransformerPolicyWrapper (both have _tanh_log_prob as a static method).
-            dist = policy.forward(obs[idx])
-            new_logp = policy._tanh_log_prob(dist, actions[idx])
-            values_pred = value_fn(obs[idx])
+            # actions[idx] are z-score samples stored in the buffer.
+            # Recompute the log-prob so the importance ratio is exact.
+            if is_transformer_policy and mb_txt_goal is not None:
+                dist = policy.forward(obs[idx], mb_txt_goal, mb_goal_state,
+                                      pose=poses[idx] if poses is not None else None)
+                values_pred = value_fn(obs[idx], mb_txt_goal, mb_goal_state,
+                                       pose=poses[idx] if poses is not None else None)
+            elif poses is not None:
+                dist = policy.forward(obs[idx], pose=poses[idx])
+                values_pred = value_fn(obs[idx], pose=poses[idx])
+            else:
+                dist = policy.forward(obs[idx])
+                values_pred = value_fn(obs[idx])
+            # Use _log_prob (new name) with _tanh_log_prob as fallback for DensePolicy.
+            new_logp = policy._log_prob(dist, actions[idx]) if hasattr(policy, "_log_prob") else policy._tanh_log_prob(dist, actions[idx])
             mb_old_logp = old_log_probs[idx]
             
             # 3. Clip the value to reduce variability during Critic training and compute value loss.

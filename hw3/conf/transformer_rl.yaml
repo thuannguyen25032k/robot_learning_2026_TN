@@ -17,7 +17,7 @@ sim:
   episode_length: 300
   use_fast_env: true
   fast_env_output_image: true
-  reward_version: "ver2"  # options: "ver1", "ver2", "ver3", "standard"
+  reward_scale: 0.1
 
 training:
   total_env_steps: 2000000
@@ -28,13 +28,14 @@ training:
   gae_lambda: 0.95
   clip_eps: 0.2
   value_coeff: 0.5
-  entropy_coeff: 0.015
+  entropy_coeff: 0
   max_grad_norm: 0.5
   learning_rate: 1e-5        # smaller LR for fine-tuning
   normalize_advantages: true
   normalize_rewards: false
   anneal_lr: true
   target_kl: 0             # KL divergence threshold for early stopping (0 to disable)
+  value_clip_eps: 10.0
 
 grpo:
   group_size: 8              # number of trajectories per initial state
