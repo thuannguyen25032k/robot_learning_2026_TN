@@ -87,8 +87,8 @@ class DensePolicyTeacher:
         """Query teacher for a deterministic action label."""
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            action, _, _, _ = self.policy.get_action(obs_t, deterministic=deterministic)
-        return action  # already a numpy array from DensePolicy.get_action
+            action, _, _ = self.policy.get_action(obs_t, deterministic=deterministic)
+        return action.squeeze(0).cpu().numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -115,69 +115,11 @@ def collect_dagger_rollout(env: FastLIBEROEnv,
         total_return: sum of environment rewards
         success: whether the task was completed
     """
+    # TODO: Roll out the student, label each visited state with the teacher, mix using beta.
     obs_list = []
     teacher_actions = []
     total_return = 0.0
     success = False
-
-    obs, info = env.reset()
-    obs = np.ascontiguousarray(obs)
-
-    # Encode goal conditioning for this episode once.
-    txt_goal, goal_state = student.encode_goals(obs, env.instruction)
-
-    use_pose = student.model._cfg.policy.use_pose_data
-    device   = student.device
-
-    def _get_pose(info_dict):
-        state_obs = info_dict.get("state_obs", None)
-        if state_obs is not None:
-            pose_np = np.ascontiguousarray(state_obs[:7], dtype=np.float32)
-        else:
-            pose_np = np.concatenate([
-                np.asarray(info_dict["robot0_eef_pos"],           dtype=np.float32),
-                np.asarray(info_dict["robot0_eef_quat"][:3],      dtype=np.float32),
-                np.asarray([info_dict["robot0_gripper_qpos"][0]], dtype=np.float32),
-            ], axis=-1)
-        pose_t = torch.from_numpy(pose_np).unsqueeze(0)
-        return student.model.encode_pose(pose_t).to(device)
-
-    pose = _get_pose(info) if use_pose else None
-
-    student.eval()
-    with torch.no_grad():
-        for _ in range(max_steps):
-            # Always record the current obs and the teacher's label for it.
-            obs_list.append(obs.copy())
-            # Teacher (DensePolicy) expects state-vector obs (13,) regardless of
-            # whether the env is in image mode.  `info["state_obs"]` is always
-            # populated by FastLIBEROEnv (see libero_env_fast.py line ~282/336).
-            state_obs_for_teacher = info.get("state_obs", obs)
-            teacher_action = teacher.get_action(state_obs_for_teacher, deterministic=True)
-            teacher_actions.append(teacher_action.copy())
-
-            # Decide whose action to execute in the env.
-            if np.random.rand() < beta:
-                # Follow teacher
-                action_np = teacher_action
-            else:
-                # Follow student
-                obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
-                action_np, _, _, _ = student.get_action(
-                    obs_t, txt_goal, goal_state, pose, deterministic=False
-                )
-
-            obs, reward, done, truncated, info = env.step(action_np)
-            obs = np.ascontiguousarray(obs)
-            total_return += float(reward)
-
-            if use_pose:
-                pose = _get_pose(info)
-
-            if done or truncated:
-                success = bool(info.get("success_placed", False))
-                break
-
     return obs_list, teacher_actions, total_return, success
 
 
@@ -189,61 +131,14 @@ def bc_update(student: TransformerPolicyWrapper,
               dataset: DAggerDataset,
               optimizer: torch.optim.Optimizer,
               cfg: DictConfig,
-              device: torch.device,
-              instruction: str = ""):
+              device: torch.device):
     """
     Run `bc_epochs_per_round` supervised epochs on the aggregated DAgger dataset.
 
     Returns dict with "bc_loss".
     """
-    if len(dataset) == 0:
-        return {"bc_loss": 0.0}
-
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=int(cfg.training.minibatch_size),
-        shuffle=True,
-        drop_last=False,
-    )
-    max_grad_norm = float(getattr(cfg.training, "max_grad_norm", 0.5))
-    n_epochs      = int(cfg.dagger.bc_epochs_per_round)
-
-    # Encode goal conditioning once — same task/instruction across all rounds.
-    # Use the first obs in the dataset as the goal image source.
-    first_obs_np = np.array(dataset.obs_list[0])
-    txt_goal, goal_state = student.encode_goals(first_obs_np, instruction)
-
-    epoch_losses = []
-    student.train()
-
-    for _epoch in range(n_epochs):
-        batch_losses = []
-        for obs_batch, action_batch in loader:
-            obs_batch    = obs_batch.to(device)     # (B, H, W, C) or (B, obs_dim)
-            action_batch = action_batch.to(device)  # (B, action_dim) — teacher's raw actions
-
-            # Encode teacher actions to z-score space so they match the
-            # distribution's support (student predicts z-scores).
-            # encode_action: raw → z-score (inverse of decode_action).
-            action_z = student.model.encode_action(action_batch)
-
-            # Forward pass — goal tensors expanded to batch size inside forward().
-            dist = student.forward(obs_batch, txt_goal, goal_state)
-
-            # Behaviour cloning loss: negative log-likelihood of the teacher's action.
-            bc_loss = -student._log_prob(dist, action_z).mean()
-
-            optimizer.zero_grad(set_to_none=True)
-            bc_loss.backward()
-            torch.nn.utils.clip_grad_norm_(student.parameters(), max_grad_norm)
-            optimizer.step()
-
-            batch_losses.append(bc_loss.detach().item())
-
-        epoch_losses.append(float(np.mean(batch_losses)))
-
-    student.eval()
-    return {"bc_loss": float(np.mean(epoch_losses))}
+    # TODO: Supervised update on the aggregated dataset for bc_epochs_per_round epochs.
+    return {"bc_loss": 0.0}
 
 
 # ---------------------------------------------------------------------------
@@ -266,14 +161,6 @@ def main(cfg: DictConfig):
 
     task_id = int(cfg.sim.eval_tasks[0])
     env = FastLIBEROEnv(task_id=task_id, max_episode_steps=cfg.sim.episode_length, cfg=cfg)
-
-    # The student (GRP transformer) needs image observations; state-vector obs
-    # would crash preprocess_goal_image (cv2.resize on a 1-D array).
-    if not env.output_image_obs:
-        raise RuntimeError(
-            "DAgger requires image observations for the transformer student. "
-            "Set sim.fast_env_output_image=true in your config."
-        )
 
     obs_dim = env.obs_dim
     action_dim = env._action_dim
@@ -298,17 +185,9 @@ def main(cfg: DictConfig):
     # --- DAgger rounds ---
     for round_idx in range(cfg.dagger.num_rounds):
 
-        # Compute beta (teacher mixing coefficient).
-        # "linear": decay from beta_init → 0 over num_rounds.
-        # "constant": always beta_init (pure teacher mixing throughout).
-        schedule = str(cfg.dagger.beta_schedule).lower()
-        if schedule == "linear":
-            # Round 0 → beta_init, round (num_rounds-1) → 0
-            n = max(1, cfg.dagger.num_rounds - 1)
-            beta = float(cfg.dagger.beta_init) * (1.0 - round_idx / n)
-        else:
-            # "constant" or any unknown schedule
-            beta = float(cfg.dagger.beta_init)
+        # Compute beta (teacher mixing coefficient)
+        # TODO: Compute beta for this round according to cfg.dagger.beta_schedule.
+        beta = cfg.dagger.beta_init
 
         print(f"\n=== DAgger Round {round_idx + 1}/{cfg.dagger.num_rounds} | beta={beta:.3f} ===")
 
@@ -330,8 +209,7 @@ def main(cfg: DictConfig):
         dataset.save(os.path.join(cfg.dagger.dataset_save_dir, f"dagger_round_{round_idx:03d}.pth"))
 
         # Behavior cloning update on aggregated dataset
-        bc_info = bc_update(student, dataset, student_optimizer, cfg, device,
-                            instruction=env.instruction)
+        bc_info = bc_update(student, dataset, student_optimizer, cfg, device)
 
         log = {
             "dagger/round": round_idx,
