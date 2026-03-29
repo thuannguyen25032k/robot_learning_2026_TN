@@ -38,9 +38,6 @@ from hydra.core.hydra_config import HydraConfig
 from hw3.train_dense_rl import RolloutBuffer, ppo_update
 from hw3.libero_env_fast import FastLIBEROEnv
 
-# Pre-compute log(2) as a scalar constant so _tanh_log_prob does not
-# allocate a new CPU tensor on every call.
-_LOG2 = math.log(2.0)
 
 # ---------------------------------------------------------------------------
 # Value function built directly on a GRP checkpoint
@@ -149,7 +146,7 @@ class TransformerPolicyWrapper(nn.Module):
 
     Key contract for PPO (``ppo_update`` in ``train_dense_rl.py``):
       - callable: ``dist = policy(obs_batch, txt_goal, goal_state)`` → Normal
-      - ``get_action()`` → ``(action_np, log_prob, entropy, pre_tanh)``
+      - ``get_action()`` → ``(action_np, log_prob, entropy, z_sample)``
 
     Goal conditioning is passed **explicitly** on every call — there is no
     hidden cached state, which makes the importance-weight ratio in PPO/GRPO
@@ -386,7 +383,7 @@ def collect_grpo_group(env: FastLIBEROEnv,
             # Convert obs to a GPU tensor for the network forward pass.
             obs_t = torch.from_numpy(obs).float().to(device)
             with torch.no_grad():
-                action_np, log_prob, _entropy, pre_tanh = policy.get_action(
+                action_np, log_prob, _entropy, z_sample = policy.get_action(
                     obs_t, txt_goal, goal_state, pose
                 )
 
@@ -395,7 +392,7 @@ def collect_grpo_group(env: FastLIBEROEnv,
 
             # Store on CPU immediately to keep GPU memory free during collection.
             traj_obs.append(obs_t.cpu())
-            traj_actions.append(pre_tanh.cpu())
+            traj_actions.append(z_sample.cpu())
             traj_log_probs.append(log_prob.cpu())
             if use_pose and pose is not None:
                 traj_poses.append(pose.squeeze(0).cpu())
@@ -719,10 +716,13 @@ def grpo_worldmodel_update(policy: TransformerPolicyWrapper,
             traj_entropies.append(ent.squeeze(0))
 
             # ---- World model step (no grad — WM is frozen) ----
+            # The world model was trained with z-score encoded actions
+            # (model.encode_action() in dreamer_model_trainer.py).
+            # Pass z_sample (z-score space) — NOT the decoded raw action.
             with torch.no_grad():
                 step_out = world_model.rssm_step(
                     rssm_state,
-                    action=action.detach(),
+                    action=z_sample.detach(),
                     embed=None,              # imagination: use prior, not posterior
                 )
                 h_t = step_out["h"]          # (1, deter_dim)
@@ -1042,7 +1042,7 @@ def main(cfg: DictConfig):
             value_fn.eval()
             with torch.no_grad():
                 for _ in range(cfg.training.rollout_length):
-                    action_np, log_prob, _, pre_tanh = policy.get_action(
+                    action_np, log_prob, _, z_sample = policy.get_action(
                         obs_t.unsqueeze(0), txt_goal, goal_state, pose
                     )
                     value = value_fn(obs_t.unsqueeze(0), txt_goal, goal_state, pose)
@@ -1053,7 +1053,7 @@ def main(cfg: DictConfig):
                     pose = _extract_pose_from_info(info, policy, device) if use_pose else None
                     buffer.add(
                         obs_t,
-                        pre_tanh.to(device),
+                        z_sample.to(device),
                         log_prob,
                         torch.tensor(reward,               device=device),
                         value.squeeze(0),
