@@ -10,7 +10,7 @@ nohup python train_transformer_rl.py \
 	sim.task_set=libero_spatial \
 	sim.eval_tasks=[0] \
 	sim.reward_scale=0.1 \
-	training.total_env_steps=2000000 \
+	training.total_env_steps=200000 \
 	training.rollout_length=4096 \
 	training.ppo_epochs=10 \
 	training.minibatch_size=256 \
