@@ -344,12 +344,13 @@ def ppo_update(policy: DensePolicy,
             mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std(unbiased=False) + 1e-8)
 
             # 1b. For transformer policies: pass explicit per-step goal conditioning.
-            # goal_states[idx] picks the goal_state stored at each rollout step.
-            # Since GRP forward is batched, we use the last step's goal as a proxy
-            # (correct for single-task setups where txt_goal never changes and
-            # goal_state only changes ~6 times per rollout).
+            # goal_states[idx] has shape (mb, H, W, C) — one goal per rollout step.
+            # We pass each observation's own goal_state directly to forward() by
+            # batch-expanding it from (mb, H, W, C) to match the obs batch.
+            # This is exact even when the rollout spans multiple episodes with
+            # different goal images (goal re-encoded on every episode reset).
             if is_transformer_policy and goal_states is not None:
-                mb_goal_state = goal_states[idx[-1]].unsqueeze(0)   # (1, H, W, C)
+                mb_goal_state = goal_states[idx]                     # (mb, H, W, C)
                 mb_txt_goal   = txt_goal_buf                         # (1, T, ...)
             else:
                 mb_goal_state = None

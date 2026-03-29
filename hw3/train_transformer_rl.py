@@ -25,7 +25,6 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../mini-grp'))
 
-import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -104,8 +103,8 @@ class ValueFunction(nn.Module):
             obs:        (B, H, W, C) float image observation (raw [0,255] or [-1,1]).
             txt_goal:   (1, T) or (1, T, n_embd) text goal tensor from
                         ``TransformerPolicyWrapper.encode_goals()``.
-            goal_state: (1, H, W, C) normalised [-1,1] goal image from
-                        ``TransformerPolicyWrapper.encode_goals()``.
+            goal_state: (1, H, W, C) or (B, H, W, C) goal image — broadcast to B
+                        if shape[0]==1, used per-step if shape[0]==B.
             pose:       (B, pose_emb_dim) encoded pose, or None.
         Returns:
             values: (B,) scalar estimates.
@@ -229,7 +228,8 @@ class TransformerPolicyWrapper(nn.Module):
         Args:
             obs:        (B, H, W, C) raw or normalised image observation.
             txt_goal:   (1, T[, n_embd]) text goal from ``encode_goals()``.
-            goal_state: (1, H, W, C) goal image from ``encode_goals()``.
+            goal_state: (1, H, W, C) or (B, H, W, C) goal image — broadcast to B
+                        if shape[0]==1, used per-step if shape[0]==B.
             pose:       (B, pose_emb_dim) encoded pose, or None.
         Returns:
             Normal distribution in z-score (GRP normalised) action space.
