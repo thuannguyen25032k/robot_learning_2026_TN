@@ -14,6 +14,8 @@ sim:
   eval_episodes: 5
   episode_length: 300
   use_fast_env: true
+  fast_env_output_image: true   # student (GRP transformer) requires image obs
+  fast_env_image_size: 64       # must match the image_shape in the student's config
 
 dagger:
   num_rounds: 10             # DAgger iterations

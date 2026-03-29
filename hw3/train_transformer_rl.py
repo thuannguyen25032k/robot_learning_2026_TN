@@ -36,6 +36,7 @@ from omegaconf import DictConfig, OmegaConf
 import wandb
 from hydra.core.hydra_config import HydraConfig
 from hw3.train_dense_rl import RolloutBuffer, ppo_update
+from hw3.grp_model import get_patches_fast, calc_positional_embeddings
 from hw3.libero_env_fast import FastLIBEROEnv
 
 # Pre-compute log(2) as a scalar constant so _tanh_log_prob does not
@@ -43,29 +44,142 @@ from hw3.libero_env_fast import FastLIBEROEnv
 _LOG2 = math.log(2.0)
 
 # ---------------------------------------------------------------------------
-# Value function built directly on a GRP checkpoint
+# Loading the GRP model from HW1 and make it as a transformer backbone for policy and value function 
 # ---------------------------------------------------------------------------
 
+class GRPBackbone(nn.Module):
+    """Shared transformer backbone loaded from a HW1 GRP checkpoint.
+
+    Runs the GRP forward pass up to (and including) the final LayerNorm and
+    returns the CLS token for use by both the policy head and the value head.
+    Random goal-modality masking (used during BC training) is disabled here
+    because it is not appropriate during RL fine-tuning.
+    """
+
+    def __init__(self, checkpoint_path: str, device: torch.device):
+        super().__init__()
+        self.device = device
+        self.model = torch.load(checkpoint_path, map_location=device, pickle_module=dill)
+        self.model.to(device)
+
+        # Mirror the exact attribute names in hw3/grp_model.py:
+        #   patch projection  → model.lin_map
+        #   pose projection   → model.lin_map_pose
+        #   CLS/readout token → model.readout_tokens
+        #   action head       → model.mlp
+        #   text embeddings   → model.token_embedding_table
+        #   positional emb    → model.positional_embeddings (registered buffer)
+        self._cfg                  = self.model._cfg
+        self.lin_map               = self.model.lin_map
+        self.readout_tokens        = self.model.readout_tokens
+        self.token_embedding_table = self.model.token_embedding_table
+        self.blocks                = self.model.blocks
+        self.ln_f                  = self.model.ln_f
+        self._use_pose             = bool(self._cfg.policy.use_pose_data)
+        self._use_t5               = bool(self._cfg.dataset.encode_with_t5)
+        self._block_size           = int(self._cfg.max_block_size)
+        self._n_embd               = int(self._cfg.n_embd)
+        if self._use_pose:
+            # grp_model.py stores the pose linear projection as lin_map_pose
+            self.lin_map_pose = self.model.lin_map_pose
+
+        # Point directly at the model's own positional embedding buffer —
+        # no copy, no extra VRAM, automatically follows any device moves.
+        # Shape is (seq_len, n_embd); we unsqueeze the batch dim at forward time.
+        self._pos_emb = self.model.positional_embeddings   # (seq_len, n_embd)
+
+        # Pre-allocate a zero pose token buffer for the no-pose fallback case
+        # (avoids a torch.zeros() call in the hot forward path).
+        self.register_buffer(
+            "_zero_pose_tok",
+            torch.zeros(1, 1, self._n_embd, device=device),
+            persistent=False,
+        )
+
+    def forward(self, obs: torch.Tensor, goal_txt: torch.Tensor, goal_img: torch.Tensor, pose: torch.Tensor = None) -> torch.Tensor:
+        """Encode obs + goals and return the CLS token representation.
+
+        Token order must match grp_model.py GRP.forward() exactly so that the
+        positional embeddings from the checkpoint are correctly aligned:
+            [readout(1), obs_patches, pose_token(1, optional), goals_e(T), goal_img_patches]
+
+        Args:
+            obs:      (B, H, W, C*stacking) float image observation
+            goal_txt: (B, T) int64 token ids  OR  (B, T, n_embd) T5 embeddings
+            goal_img: (B, H, W, C) float goal image
+            pose:     (B, pose_dim) encoded pose, or None
+        Returns:
+            cls: (B, n_embd) readout token after final LayerNorm
+        """
+        # All inputs should already be on device; avoid redundant .to() in the hot path.
+        B = obs.shape[0]
+
+        # --- Patch projections (shared weight for obs and goal image) ---
+        obs_tokens      = self.lin_map(get_patches_fast(obs,      self._cfg))
+        goal_img_tokens = self.lin_map(get_patches_fast(goal_img, self._cfg))
+
+        # --- Text goal embeddings (mirror grp_model.py logic) ---
+        if self._use_t5:
+            # goal_txt is (B, T, n_embd) float — already in embedding space
+            goals_e = goal_txt if goal_txt.dim() == 3 else goal_txt.unsqueeze(0)
+        else:
+            # goal_txt is (B, T) int64 token ids
+            ids = goal_txt.squeeze(1) if goal_txt.dim() == 3 else goal_txt
+            goals_e = self.token_embedding_table(ids.long())  # (B, T, n_embd)
+
+        # Pad / trim to block_size (usually already the right size after reset_context)
+        cur_len = goals_e.size(1)
+        if cur_len < self._block_size:
+            pad = goals_e.new_zeros(B, self._block_size - cur_len, self._n_embd)
+            goals_e = torch.cat((goals_e, pad), dim=1)
+        elif cur_len > self._block_size:
+            goals_e = goals_e[:, :self._block_size, :]
+
+        # --- Readout (CLS) token ---
+        cls_token = self.readout_tokens.expand(B, -1, -1)  # (B, 1, n_embd)
+
+        # --- Build token sequence in the same order as grp_model.py ---
+        # [readout, obs_patches, pose_token(opt), goals_e, goal_img_patches]
+        if self._use_pose:
+            if pose is not None:
+                pose_tokens = self.lin_map_pose(pose)
+                if pose_tokens.dim() == 2:
+                    pose_tokens = pose_tokens.unsqueeze(1)     # (B, 1, n_embd)
+            else:
+                # Expand pre-allocated zero buffer instead of allocating a new tensor
+                pose_tokens = self._zero_pose_tok.expand(B, -1, -1)
+            x = torch.cat([cls_token, obs_tokens, pose_tokens, goals_e, goal_img_tokens], dim=1)
+        else:
+            x = torch.cat([cls_token, obs_tokens, goals_e, goal_img_tokens], dim=1)
+
+        # --- Positional embeddings ---
+        # _pos_emb is (seq_len, n_embd); unsqueeze(0) for broadcast over batch.
+        x = x + self._pos_emb[: x.shape[1]].unsqueeze(0)
+
+        # --- Transformer blocks (no goal-masking during RL fine-tuning) ---
+        for block in self.blocks:
+            x = block(x, mask=None)
+        x = self.ln_f(x)
+
+        return x[:, 0, :]  # readout / CLS token
+
 class ValueFunction(nn.Module):
-    """Value network V(s) built directly from a GRP checkpoint.
+    """Value network V(s) with a two-mode backbone:
 
-    Loads the same GRP model from ``checkpoint_path``, replaces the action head
-    (``model.mlp``) with a new ``value_head`` (Linear → scalar), and runs the
-    full GRP forward pass up to the CLS token to produce V(s).
+    - **Shared** (``shared_network=True``): reuses the *same* ``GRPBackbone``
+      instance as the policy.  Backbone weights are updated jointly with the
+      policy through one shared optimizer.
+    - **Separate** (``shared_network=False``): owns its *own* private
+      ``GRPBackbone`` loaded from the same checkpoint but with independent
+      weights, so the critic can specialize without interfering with the actor.
 
-    - **Shared** (``shared_network=True``): the ``model`` attribute points to the
-      *same* GRP model object as the policy so transformer weights are shared
-      and updated jointly.
-    - **Separate** (``shared_network=False``): loads an independent copy of the
-      checkpoint so the critic can specialise without interfering with the actor.
-
-    Goal conditioning is passed explicitly to ``forward()`` on every call —
-    there is no cached state on this object, so stale-context bugs are impossible.
+    In both modes the value head MLP architecture is identical.
+    Goal conditioning is cached per episode via ``reset_context()``.
     """
 
     def __init__(
         self,
-        policy: "TransformerPolicyWrapper",
+        backbone: GRPBackbone,
         device: torch.device,
         cfg: DictConfig,
         shared_network: bool = True,
@@ -76,67 +190,52 @@ class ValueFunction(nn.Module):
         self.shared_network = shared_network
 
         if shared_network:
-            # Point at the policy's own GRP model — no extra parameters.
-            self.model = policy.model
+            # Reuse the policy's backbone — no extra parameters.
+            self.backbone = backbone
         else:
-            # Load an independent copy from the same checkpoint.
-            self.model = torch.load(cfg.init_checkpoint, map_location=device, pickle_module=dill)
-            self.model.to(device)
+            # Clone an independent backbone from the same checkpoint so the
+            # critic starts from the same pre-trained weights but diverges freely.
+            self.backbone = GRPBackbone(cfg.init_checkpoint, device)
 
-        n_embd = int(self.model._cfg.n_embd)
+        n_embd = self.backbone._cfg.n_embd
         self.value_head = nn.Sequential(
             nn.Linear(n_embd, 1),
         )
         nn.init.orthogonal_(self.value_head[-1].weight, gain=0.01)
         nn.init.constant_(self.value_head[-1].bias, 0)
+
+        # Goal caches — populated by reset_context()
+        self.txt_goal   = None
+        self.goal_state = None
         self.to(device)
 
-    def forward(
-        self,
-        obs: torch.Tensor,
-        txt_goal: torch.Tensor,
-        goal_state: torch.Tensor,
-        pose: torch.Tensor = None,
-    ) -> torch.Tensor:
+    def reset_context(self, policy_goal_state: torch.Tensor, policy_text_goal: torch.Tensor):
+        """Cache goal tensors already produced by the policy's reset_context().
+
+        policy_goal_state is (1, H, W, C) — the pre-batched goal image tensor
+        stored by TransformerPolicyWrapper.reset_context().
+        """
+        self.txt_goal   = None if policy_text_goal  is None else policy_text_goal.to(self.device)
+        self.goal_state = None if policy_goal_state is None else policy_goal_state.to(self.device)
+
+    def forward(self, obs: torch.Tensor, pose: torch.Tensor = None) -> torch.Tensor:
         """Compute V(s).
 
-        Runs the full GRP forward pass (identical to the policy) but feeds the
-        CLS token into ``value_head`` instead of the action head.
-
         Args:
-            obs:        (B, H, W, C) float image observation (raw [0,255] or [-1,1]).
-            txt_goal:   (1, T) or (1, T, n_embd) text goal tensor from
-                        ``TransformerPolicyWrapper.encode_goals()``.
-            goal_state: (1, H, W, C) normalised [-1,1] goal image from
-                        ``TransformerPolicyWrapper.encode_goals()``.
-            pose:       (B, pose_emb_dim) encoded pose, or None.
+            obs:  (B, H, W, C) float image observation
+            pose: (B, pose_dim) encoded pose, or None
         Returns:
-            values: (B,) scalar estimates.
+            values: (B,) scalar estimates
         """
         obs = obs.to(self.device)
-        # Normalise raw [0,255] images to the [-1,1] range the GRP was trained on.
-        if obs.dtype == torch.uint8:
-            obs = obs.float().div_(127.5).sub_(1.0)
-        elif obs.max() > 1.5:
-            obs = obs.div(127.5).sub(1.0)
-        B = obs.shape[0]
+        B   = obs.shape[0]
 
-        # Expand (1, …) goal tensors to match the batch dimension.
-        txt_goal_b   = txt_goal.to(self.device).expand(B,   *txt_goal.shape[1:])
-        goal_state_b = goal_state.to(self.device).expand(B, *goal_state.shape[1:])
+        # txt_goal: (1, T) → (B, T);  goal_state: (1, H, W, C) → (B, H, W, C)
+        # Both are zero-copy expand views.
+        txt_goal   = self.txt_goal.expand(B,  *self.txt_goal.shape[1:])   if self.txt_goal   is not None else None
+        goal_state = self.goal_state.expand(B, *self.goal_state.shape[1:]) if self.goal_state is not None else None
 
-        # Run the GRP forward pass up to the CLS token, bypassing model.mlp.
-        # We monkey-patch model.mlp temporarily with nn.Identity so that GRP's
-        # "logits = self.mlp(cls_token)" returns the raw (B, n_embd) CLS vector.
-        # This is single-threaded safe (training loop never calls policy and
-        # value_fn concurrently) and avoids duplicating the transformer code.
-        original_mlp = self.model.mlp
-        self.model.mlp = nn.Identity()
-        try:
-            cls_tok, _ = self.model(obs, txt_goal_b, goal_state_b, pose=pose)
-        finally:
-            self.model.mlp = original_mlp  # always restore, even if forward() throws
-
+        cls_tok = self.backbone(obs, txt_goal, goal_state, pose)
         return self.value_head(cls_tok).squeeze(-1)
 
 
@@ -148,13 +247,10 @@ class TransformerPolicyWrapper(nn.Module):
     """PPO-compatible wrapper around the HW1 GRP transformer.
 
     Key contract for PPO (``ppo_update`` in ``train_dense_rl.py``):
-      - callable: ``dist = policy(obs_batch, txt_goal, goal_state)`` → Normal
-      - ``get_action()`` → ``(action_np, log_prob, entropy, pre_tanh)``
+      - callable: ``dist = policy(obs_batch)`` → ``torch.distributions.Normal``
+      - ``get_action()`` → ``(action_np, log_prob, entropy, pre_tanh)`` for env stepping
 
-    Goal conditioning is passed **explicitly** on every call — there is no
-    hidden cached state, which makes the importance-weight ratio in PPO/GRPO
-    exact even when a minibatch spans multiple episodes with different goals.
-    Use ``encode_goals()`` once per episode to obtain the tensors.
+    Goal conditioning is cached per episode via ``reset_context()``.
     """
 
     def __init__(self, checkpoint_path: str, device: torch.device, cfg: DictConfig):
@@ -170,10 +266,10 @@ class TransformerPolicyWrapper(nn.Module):
         action_out_features = self.action_head[0].out_features
 
         # Learnable state-independent log std for Gaussian head.
+        # Initialize to zeros → std = 1.0 at the start of RL fine-tuning.
         self._action_log_std = nn.Parameter(torch.zeros(
             action_out_features, device=device
         ))
-        nn.init.constant_(self._action_log_std, -1)  # std ~ 0.45 at start of RL
         # Cache decode_action tensors on device so forward() never rebuilds them.
         self.register_buffer(
             "_action_mean",
@@ -185,136 +281,83 @@ class TransformerPolicyWrapper(nn.Module):
             torch.tensor(self.model._cfg.dataset.action_std, dtype=torch.float32, device=device),
             persistent=False,
         )
+        self.txt_goal   = None
+        self.goal_state = None
         self.to(device)
 
-    def encode_goals(self, first_obs: np.ndarray, instruction: str):
-        """Encode goal conditioning for one episode and return the tensors.
+    def reset_context(self, first_obs: np.ndarray, instruction: str):
+        """Encode and cache goal conditioning for the current episode.
 
-        Returns:
-            txt_goal:   (1, T) int64 token ids  OR  (1, T, n_embd) T5 floats
-            goal_state: (1, H, W, C) float tensor normalised to [-1, 1]
-
-        The caller owns these tensors and passes them explicitly to
-        ``forward()`` and ``get_action()`` on every step of the episode.
-        This avoids any implicit cached state on the wrapper.
+        Stores:
+          self.txt_goal   — (1, T) int64 token ids  OR  (1, T, n_embd) T5 floats
+          self.goal_state — (1, H, W, C) float tensor, pre-batched so forward()
+                            can call expand() without unsqueeze() on every step.
         """
         model = self.model
-        txt_goal = model.encode_text_goal(instruction).to(self.device)
+        self.txt_goal = model.encode_text_goal(instruction).to(self.device)
         if first_obs is not None:
-            # preprocess_goal_image: resize + (img/255)*2-1 → (H, W, C) float [-1,1]
-            goal_np    = model.preprocess_goal_image(first_obs)
-            goal_state = torch.tensor(
+            # preprocess_goal_image returns (H, W, C) numpy float.
+            # Store as (1, H, W, C) so forward() only needs expand(), no unsqueeze.
+            goal_np = model.preprocess_goal_image(first_obs)
+            self.goal_state = torch.tensor(
                 goal_np, dtype=torch.float32, device=self.device
             ).unsqueeze(0)   # (1, H, W, C)
         else:
-            goal_state = torch.zeros(
-                1, *model._cfg.image_shape, dtype=torch.float32, device=self.device
-            )
-        return txt_goal, goal_state
+            self.goal_state = None
 
-    def _preprocess_obs(self, obs: torch.Tensor) -> torch.Tensor:
-        """Normalise a raw [0,255] image tensor to [-1,1]."""
-        if obs.dtype == torch.uint8:
-            return obs.float().div_(127.5).sub_(1.0)
-        if obs.max() > 1.5:          # float still in [0, 255]
-            return obs.div(127.5).sub(1.0)
-        return obs                   # already in [-1, 1]
-
-    def forward(
-        self,
-        obs: torch.Tensor,
-        txt_goal: torch.Tensor,
-        goal_state: torch.Tensor,
-        pose: torch.Tensor = None,
-    ) -> Normal:
-        """Return the action distribution for a batch of observations.
-
-        Args:
-            obs:        (B, H, W, C) raw or normalised image observation.
-            txt_goal:   (1, T[, n_embd]) text goal from ``encode_goals()``.
-            goal_state: (1, H, W, C) goal image from ``encode_goals()``.
-            pose:       (B, pose_emb_dim) encoded pose, or None.
-        Returns:
-            Normal distribution in z-score (GRP normalised) action space.
-        """
-        obs = self._preprocess_obs(obs.to(self.device))
+    def forward(self, obs: torch.Tensor, pose: torch.Tensor = None) -> Normal:
+        obs = obs.to(self.device)
         B   = obs.shape[0]
 
-        # Expand (1, …) goal tensors to the batch size — zero-copy views.
-        txt_goal_b   = txt_goal.to(self.device).expand(B,   *txt_goal.shape[1:])
-        goal_state_b = goal_state.to(self.device).expand(B, *goal_state.shape[1:])
+        # txt_goal: (1, T) or (1, T, n_embd) → (B, ...)
+        txt_goal   = self.txt_goal.expand(B, *self.txt_goal.shape[1:])
+        # goal_state: (1, H, W, C) → (B, H, W, C); expand is a zero-copy view.
+        goal_state = self.goal_state.expand(B, *self.goal_state.shape[1:])
 
-        raw_logits, _ = self.model(obs, txt_goal_b, goal_state_b, pose=pose)
-        # raw_logits is in the GRP normalised action space (z-scores).
-        # Keep the distribution in that space — tanh squashing is done in
-        # get_action(), so the pretrained mean is faithfully preserved at
-        # the start of RL fine-tuning and the log-prob is self-consistent.
+        raw_logits, _ = self.model(obs, txt_goal, goal_state, pose)
+        print(f"[TransformerPolicyWrapper] raw_logits: {raw_logits.shape} {raw_logits.dtype}")
+        # Decode from normalised space to raw action space in one fused op.
+        action_mean = raw_logits * self._action_std + self._action_mean
+
         log_std    = self._action_log_std.clamp(-5.0, 1.0)
-        action_std = log_std.exp().expand_as(raw_logits)
-        return Normal(raw_logits, action_std)
-
-    def _decode_action(self, normalised_action: torch.Tensor) -> torch.Tensor:
-        """Decode GRP normalised action (z-score) → raw action space."""
-        return normalised_action * self._action_std + self._action_mean
+        action_std = log_std.exp().expand_as(action_mean)
+        return Normal(action_mean, action_std)
 
     @staticmethod
-    def _log_prob(dist: Normal, z_action: torch.Tensor) -> torch.Tensor:
-        """Log-prob of a sampled z-score action under the Gaussian distribution.
+    def _tanh_log_prob(dist: Normal, pre_tanh_action: torch.Tensor) -> torch.Tensor:
+        """Log-prob of a tanh-squashed action with Jacobian correction.
 
-        The policy distribution lives in z-score space and the env action is
-        obtained via linear decode (z * std + mean), which is a volume-preserving
-        affine map up to a constant Jacobian that cancels in importance ratios.
-        No Jacobian correction is needed here.
+        For action = tanh(u), u ~ Normal:
+            log π(a) = log p(u) - sum log(1 - tanh²(u))
+        Numerically stable form: 2*(log2 - u - softplus(-2u))
+        Uses the module-level _LOG2 float constant to avoid a tensor allocation per call.
         """
-        return dist.log_prob(z_action).sum(-1)
+        log_prob = dist.log_prob(pre_tanh_action).sum(-1)
+        correction = 2.0 * (
+            _LOG2
+            - pre_tanh_action
+            - torch.nn.functional.softplus(-2.0 * pre_tanh_action)
+        ).sum(-1)
+        return log_prob - correction
 
-    # Keep old name as alias so grpo_update and ppo_update call sites don't break.
-    _tanh_log_prob = _log_prob
-
-    def get_action(
-        self,
-        obs_t: torch.Tensor,
-        txt_goal: torch.Tensor,
-        goal_state: torch.Tensor,
-        pose: torch.Tensor = None,
-        deterministic: bool = False,
-    ):
-        """Sample an action and return rollout data.
-
-        Args:
-            obs_t:      (1, H, W, C) or (H, W, C) raw image tensor.
-            txt_goal:   (1, T[, n_embd]) from ``encode_goals()``.
-            goal_state: (1, H, W, C) from ``encode_goals()``.
-            pose:       (1, pose_emb_dim) encoded pose, or None.
-            deterministic: if True, use dist.mean (no sampling).
-        Returns:
-            action_np:  (action_dim,) numpy array in the env's action space.
-            log_prob:   scalar tensor (detached).
-            entropy:    scalar tensor (detached).
-            z_sample:   (action_dim,) tensor in z-score space (for PPO buffer).
-        """
+    def get_action(self, obs_t: torch.Tensor, pose: torch.Tensor, deterministic: bool = False):
         if obs_t.dim() == 3:
             obs_t = obs_t.unsqueeze(0)
-        dist     = self.forward(obs_t, txt_goal, goal_state, pose)
-        z_sample = dist.mean if deterministic else dist.rsample()  # z-score space
-        log_prob = self._log_prob(dist, z_sample)
-        entropy  = dist.entropy().sum(-1)
-        # Decode z-score → raw action space (same transform used in BC training
-        # and sim_eval.py: action = z * action_std + action_mean).
-        action_t = self._decode_action(z_sample)
-        return (
-            action_t.squeeze(0).detach().cpu().numpy(),
-            log_prob.squeeze(0),
-            entropy.squeeze(0),
-            z_sample.squeeze(0),
-        )
+        dist      = self.forward(obs_t, pose)
+        pre_tanh  = dist.mean if deterministic else dist.rsample()
+        log_prob  = self._tanh_log_prob(dist, pre_tanh)
+        entropy   = dist.entropy().sum(-1)
+        action_t  = torch.tanh(pre_tanh)           # squash to (-1, 1)
+        # Return pre_tanh as 4th value so buffer/grpo stores it for exact
+        # log_prob recomputation (avoids clamp-induced gradient corruption).
+        return action_t.squeeze(0).detach().cpu().numpy(), log_prob.squeeze(0), entropy.squeeze(0), pre_tanh.squeeze(0)
 
 
 # ---------------------------------------------------------------------------
 # GRPO helpers
 # ---------------------------------------------------------------------------
 
-def _extract_pose_from_info(info: dict, policy: "TransformerPolicyWrapper", device: torch.device) -> torch.Tensor:
+def _extract_pose_from_info(info: dict, backbone: GRPBackbone, device: torch.device) -> torch.Tensor:
     """Extract and encode a (1, pose_emb_dim) pose tensor from an env info dict.
 
     ``FastLIBEROEnv`` stores the full state vector under ``info["state_obs"]``
@@ -333,11 +376,12 @@ def _extract_pose_from_info(info: dict, policy: "TransformerPolicyWrapper", devi
         ], axis=-1)
     # from_numpy avoids a data copy; unsqueeze adds the batch dim.
     pose_t = torch.from_numpy(pose_np).unsqueeze(0)   # (1, 7)
-    return policy.model.encode_pose(pose_t).to(device)  # (1, pose_emb_dim)
+    return backbone.model.encode_pose(pose_t).to(device)  # (1, pose_emb_dim)
 
 
 def collect_grpo_group(env: FastLIBEROEnv,
                        policy: TransformerPolicyWrapper,
+                       backbone: GRPBackbone,
                        init_state,
                        group_size: int,
                        max_steps: int,
@@ -346,11 +390,11 @@ def collect_grpo_group(env: FastLIBEROEnv,
     Reset to the same initial state and collect `group_size` trajectories.
 
     Returns a list of trajectory dicts, each containing:
-        obs, actions, log_probs, poses, txt_goal, goal_state, rewards, dones, total_return
+        obs, actions, log_probs, poses, rewards, dones, total_return
     """
     trajectories = []
     instruction = env.instruction
-    use_pose = policy.model._cfg.policy.use_pose_data
+    use_pose = backbone._cfg.policy.use_pose_data
 
     if group_size <= 0:
         return trajectories
@@ -366,9 +410,7 @@ def collect_grpo_group(env: FastLIBEROEnv,
         if obs.ndim != 3:
             raise ValueError(f"Expected image observations for transformer GRPO, got shape={obs.shape}")
 
-        # Encode goal conditioning for this episode — returned as plain tensors,
-        # no hidden state on the policy object.
-        txt_goal, goal_state = policy.encode_goals(obs, instruction)
+        policy.reset_context(obs, instruction)
 
         traj_obs = []
         traj_actions = []
@@ -380,20 +422,19 @@ def collect_grpo_group(env: FastLIBEROEnv,
         total_return = 0.0
 
         # Encode initial pose from reset info
-        pose = _extract_pose_from_info(info, policy, device) if use_pose else None
+        pose = _extract_pose_from_info(info, backbone, device) if use_pose else None
 
         for _step in range(max_steps):
             # Convert obs to a GPU tensor for the network forward pass.
             obs_t = torch.from_numpy(obs).float().to(device)
             with torch.no_grad():
-                action_np, log_prob, _entropy, pre_tanh = policy.get_action(
-                    obs_t, txt_goal, goal_state, pose
-                )
+                action_np, log_prob, _entropy, pre_tanh = policy.get_action(obs_t, pose)
 
             next_obs, reward, done, truncated, _info = env.step(action_np)
             terminal = bool(done or truncated)
 
             # Store on CPU immediately to keep GPU memory free during collection.
+            # obs_t is needed on GPU for the network but stored on CPU in the buffer.
             traj_obs.append(obs_t.cpu())
             traj_actions.append(pre_tanh.cpu())
             traj_log_probs.append(log_prob.cpu())
@@ -403,37 +444,34 @@ def collect_grpo_group(env: FastLIBEROEnv,
             traj_dones.append(float(terminal))
 
             total_return += float(reward)
+            # np.ascontiguousarray only copies if the array is non-contiguous.
             obs = np.ascontiguousarray(next_obs)
 
             if use_pose:
-                pose = _extract_pose_from_info(_info, policy, device)
+                pose = _extract_pose_from_info(_info, backbone, device)
 
             if terminal:
                 break
 
         if traj_obs:
             trajectory = {
-                "obs":        torch.stack(traj_obs,    dim=0),
-                "actions":    torch.stack(traj_actions, dim=0),
-                "log_probs":  torch.stack(traj_log_probs, dim=0),
-                "poses":      torch.stack(traj_poses, dim=0) if traj_poses else None,
-                "txt_goal":   txt_goal.cpu(),    # (1, T[, n_embd]) — same for whole traj
-                "goal_state": goal_state.cpu(),  # (1, H, W, C) — same for whole traj
-                "rewards":    torch.tensor(traj_rewards, dtype=torch.float32),
-                "dones":      torch.tensor(traj_dones,   dtype=torch.float32),
+                "obs": torch.stack(traj_obs, dim=0),
+                "actions": torch.stack(traj_actions, dim=0),
+                "log_probs": torch.stack(traj_log_probs, dim=0),
+                "poses": torch.stack(traj_poses, dim=0) if traj_poses else None,
+                "rewards": torch.tensor(traj_rewards, dtype=torch.float32),
+                "dones": torch.tensor(traj_dones, dtype=torch.float32),
                 "total_return": float(total_return),
             }
         else:
             # Extremely defensive fallback: empty trajectory if env terminates instantly.
             trajectory = {
-                "obs":        torch.empty((0, *obs.shape), dtype=torch.float32),
-                "actions":    torch.empty((0, env._action_dim), dtype=torch.float32),
-                "log_probs":  torch.empty((0,), dtype=torch.float32),
-                "poses":      None,
-                "txt_goal":   txt_goal.cpu(),
-                "goal_state": goal_state.cpu(),
-                "rewards":    torch.empty((0,), dtype=torch.float32),
-                "dones":      torch.empty((0,), dtype=torch.float32),
+                "obs": torch.empty((0, *obs.shape), dtype=torch.float32),
+                "actions": torch.empty((0, env._action_dim), dtype=torch.float32),
+                "log_probs": torch.empty((0,), dtype=torch.float32),
+                "poses": None,
+                "rewards": torch.empty((0,), dtype=torch.float32),
+                "dones": torch.empty((0,), dtype=torch.float32),
                 "total_return": 0.0,
             }
         trajectories.append(trajectory)
@@ -465,17 +503,9 @@ def grpo_update(policy: TransformerPolicyWrapper,
     entropy_coef = float(getattr(cfg.training, "entropy_coef", getattr(cfg.training, "entropy_coeff", 0.0)))
     max_grad_norm = float(getattr(cfg.training, "max_grad_norm", 0.5))
 
-    # ---- 1. Build a flat list per timestep ----
-    # Each trajectory carries its own txt_goal/goal_state, so we process each
-    # trajectory separately (one forward pass per trajectory) to keep goal
-    # conditioning exact.  This is slightly slower than one mega-batch but
-    # correct — GRPO groups are small (≤8 trajs) so the cost is negligible.
-    all_new_lp, all_old_lp, all_adv, all_entropy = [], [], [], []
+    # ---- 1. Build a flat list of (obs, actions, old_log_probs, poses, adv_scalar) ----
+    all_obs, all_actions, all_old_lp, all_poses, all_adv = [], [], [], [], []
     mean_returns, group_adv_stats = [], []
-
-    policy_optimizer.zero_grad(set_to_none=True)
-    was_training = policy.training
-    policy.eval()  # eval mode for importance-weight recomputation (no dropout)
 
     for group in trajectories_per_group:
         if not group:
@@ -496,49 +526,61 @@ def grpo_update(policy: TransformerPolicyWrapper,
         for traj, traj_adv in zip(group, group_adv):
             obs     = traj["obs"]
             actions = traj["actions"]
-            lp_old  = traj["log_probs"]
+            lp      = traj["log_probs"]
             poses   = traj["poses"]
-            txt_goal   = traj["txt_goal"]
-            goal_state = traj["goal_state"]
             if obs.numel() == 0:
                 continue
             T = obs.shape[0]
-
-            obs_dev    = obs.to(device)
-            act_dev    = actions.to(device)
-            lp_old_dev = lp_old.to(device)
-            pose_dev   = poses.to(device) if poses is not None else None
-            txt_dev    = txt_goal.to(device)
-            gs_dev     = goal_state.to(device)
-
-            # Recompute log-probs with the current policy using this trajectory's
-            # exact goal conditioning — no stale-context risk.
-            # actions stores z-score samples (output of dist.rsample()).
-            dist     = policy(obs_dev, txt_dev, gs_dev, pose_dev)
-            new_lp   = TransformerPolicyWrapper._log_prob(dist, act_dev)
-            ent      = dist.entropy().sum(-1)
-
-            adv_vec = torch.full((T,), float(traj_adv.item()), dtype=torch.float32, device=device)
-            all_new_lp.append(new_lp)
-            all_old_lp.append(lp_old_dev)
+            # Broadcast scalar advantage to every timestep in the trajectory.
+            adv_vec = torch.full((T,), float(traj_adv.item()), dtype=torch.float32)
+            all_obs.append(obs)
+            all_actions.append(actions)
+            all_old_lp.append(lp)
+            # poses has shape (T, pose_emb_dim); store None separately and fill later.
+            all_poses.append(poses)
             all_adv.append(adv_vec)
-            all_entropy.append(ent)
 
-    policy.train(was_training)
-
-    if not all_new_lp:
+    if not all_obs:
         return {"policy_loss": 0.0, "entropy": 0.0, "mean_return": 0.0, "group_adv_mean_abs": 0.0}
 
-    new_lp_cat  = torch.cat(all_new_lp,  dim=0)
-    old_lp_cat  = torch.cat(all_old_lp,  dim=0)
-    adv_cat     = torch.cat(all_adv,     dim=0)
-    entropy_cat = torch.cat(all_entropy, dim=0)
+    # ---- 2. Single batched forward pass ----
+    obs_cat      = torch.cat(all_obs,      dim=0).to(device)
+    actions_cat  = torch.cat(all_actions,  dim=0).to(device)
+    old_lp_cat   = torch.cat(all_old_lp,   dim=0).to(device)
+    adv_cat      = torch.cat(all_adv,      dim=0).to(device)
 
-    ratio  = torch.exp(new_lp_cat - old_lp_cat)
+    # Build poses_input only when the backbone uses pose data.
+    # all_poses entries are (T, pose_emb_dim) tensors or None.
+    # For None entries, substitute a zero tensor of the correct pose_emb_dim so
+    # the cat does not crash.  We infer pose_emb_dim from the first non-None entry.
+    if policy.backbone._use_pose:
+        pose_emb_dim = next((p.shape[-1] for p in all_poses if p is not None), None)
+        if pose_emb_dim is not None:
+            filled = [
+                p if p is not None else torch.zeros(all_obs[i].shape[0], pose_emb_dim)
+                for i, p in enumerate(all_poses)
+            ]
+            poses_input = torch.cat(filled, dim=0).to(device)
+        else:
+            poses_input = None
+    else:
+        poses_input = None
+
+    policy_optimizer.zero_grad(set_to_none=True)
+
+    # Recompute log-probs in eval mode (no dropout) to match the collection
+    # mode used in collect_grpo_group — keeps the importance-weight ratio clean.
+    was_training = policy.training
+    policy.eval()
+    dist         = policy(obs_cat, poses_input)
+    new_log_probs = TransformerPolicyWrapper._tanh_log_prob(dist, actions_cat)
+    entropy       = dist.entropy().sum(-1).mean()
+    policy.train(was_training)
+
+    ratio  = torch.exp(new_log_probs - old_lp_cat)
     surr1  = ratio * adv_cat
     surr2  = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_cat
     policy_loss = -torch.min(surr1, surr2).mean()
-    entropy     = entropy_cat.mean()
     loss = policy_loss - entropy_coef * entropy
     loss.backward()
 
@@ -563,7 +605,6 @@ def grpo_update(policy: TransformerPolicyWrapper,
 def grpo_worldmodel_update(policy: TransformerPolicyWrapper,
                             world_model,
                             current_obs: np.ndarray,
-                            instruction: str,
                             group_size: int,
                             horizon: int,
                             cfg: DictConfig,
@@ -630,10 +671,6 @@ def grpo_worldmodel_update(policy: TransformerPolicyWrapper,
         raise ValueError(
             f"current_obs must be (H, W, C), got shape {current_obs.shape}"
         )
-
-    # Encode goal conditioning once for all imagined trajectories in this group.
-    # encode_goals is a pure function (no side effects on policy state).
-    txt_goal, goal_state = policy.encode_goals(current_obs, instruction)
 
     # ------------------------------------------------------------------ #
     # Helper: (H,W,C) uint8/float numpy → (1,C,H,W) float tensor [-1,1] #
@@ -710,11 +747,11 @@ def grpo_worldmodel_update(policy: TransformerPolicyWrapper,
 
         for _step in range(horizon):
             # ---- Policy samples action (grad flows through log_prob) ----
-            dist     = policy(cur_policy_obs.unsqueeze(0), txt_goal, goal_state)  # → Normal
-            z_sample = dist.rsample()                         # (1, action_dim), z-score
-            action   = policy._decode_action(z_sample)        # decode to raw action space
-            lp       = TransformerPolicyWrapper._log_prob(dist, z_sample)  # (1,)
-            ent      = dist.entropy().sum(-1)                  # (1,)
+            dist      = policy(cur_policy_obs.unsqueeze(0))   # (1,H,W,C) → Normal
+            pre_tanh  = dist.rsample()                         # (1, action_dim), pre-tanh
+            action    = torch.tanh(pre_tanh)                   # squashed to (-1, 1)
+            lp        = TransformerPolicyWrapper._tanh_log_prob(dist, pre_tanh)  # (1,)
+            ent       = dist.entropy().sum(-1)                  # (1,)
             traj_log_probs.append(lp.squeeze(0))
             traj_entropies.append(ent.squeeze(0))
 
@@ -865,29 +902,31 @@ def evaluate_policy(
     was_training = policy.training
     policy.eval()
 
-    use_pose = policy.model._cfg.policy.use_pose_data
+    use_pose = policy.backbone._cfg.policy.use_pose_data
 
     with torch.no_grad():
         for _ in range(n_episodes):
             obs, info = eval_env.reset()
             obs = np.ascontiguousarray(obs)
-            # Encode goal conditioning for this episode — explicit, no hidden state.
-            txt_goal, goal_state = policy.encode_goals(obs, eval_env.instruction)
-            pose = _extract_pose_from_info(info, policy, device) if use_pose else None
+            # Re-encode goal conditioning for this episode's fresh first observation.
+            # Without this call txt_goal/goal_state remain stale from training.
+            policy.reset_context(obs, eval_env.instruction)
+            pose = _extract_pose_from_info(info, policy.backbone, device) if use_pose else None
             ep_return = 0.0
             ep_length = 0
             success   = 0.0
             ep_frames : list[np.ndarray] = []
 
             for _ in range(max_ep_steps):
+                # Deterministic action (use mean of the Gaussian).
+                # NOTE: get_action() already returns a numpy array; do NOT call
+                # .squeeze(0).cpu().numpy() on it — that would raise AttributeError.
                 obs_t = torch.from_numpy(obs).float().unsqueeze(0).to(device)
-                action_np, _, _, _ = policy.get_action(
-                    obs_t, txt_goal, goal_state, pose, deterministic=True
-                )
+                action_np, _, _, _ = policy.get_action(obs_t, pose, deterministic=True)
 
                 obs, reward, done, truncated, info = eval_env.step(action_np)
                 obs = np.ascontiguousarray(obs)
-                pose = _extract_pose_from_info(info, policy, device) if use_pose else None
+                pose = _extract_pose_from_info(info, policy.backbone, device) if use_pose else None
 
                 ep_return += float(reward)
                 ep_length += 1
@@ -983,15 +1022,16 @@ def main(cfg: DictConfig):
     action_dim  = env._action_dim
 
     # Load transformer policy from HW1 checkpoint
-    policy   = TransformerPolicyWrapper(cfg.init_checkpoint, device, cfg)
+    backbone = GRPBackbone(cfg.init_checkpoint, device)
+    policy   = TransformerPolicyWrapper(backbone, device, cfg)
 
-    # Value function: shared or separate model, same head architecture.
+    # Value function: shared or separate backbone, same head architecture.
     shared_network = bool(cfg.value.get("shared_network", True))
-    value_fn = ValueFunction(policy, device, cfg, shared_network=shared_network)
-    print(f"Value network mode: {'shared model' if shared_network else 'separate model'}")
+    value_fn = ValueFunction(backbone, device, cfg, shared_network=shared_network)
+    print(f"Value network mode: {'shared backbone' if shared_network else 'separate backbone'}")
 
     if shared_network:
-        # Shared model — deduplicate parameters so the GRP model is only
+        # Shared backbone — deduplicate parameters so the backbone is only
         # optimized once even though both policy and value_fn reference it.
         _seen, _params = set(), []
         for p in list(policy.parameters()) + list(value_fn.parameters()):
@@ -1000,7 +1040,7 @@ def main(cfg: DictConfig):
                 _params.append(p)
         optimizer = torch.optim.Adam(_params, lr=cfg.training.learning_rate)
     else:
-        # Separate models — policy and value_fn own entirely distinct parameters;
+        # Separate backbone — policy and value_fn own entirely distinct parameters;
         # no deduplication needed, but value critic may benefit from a higher LR.
         value_lr = float(cfg.value.get("learning_rate", cfg.training.learning_rate))
         optimizer = torch.optim.Adam([
@@ -1019,12 +1059,13 @@ def main(cfg: DictConfig):
         if obs.ndim != 3:
             raise ValueError(f"Expected image obs (H,W,C), got shape={obs.shape}")
 
-        use_pose = policy.model._cfg.policy.use_pose_data
-        pose = _extract_pose_from_info(info, policy, device) if use_pose else None
+        use_pose = backbone._cfg.policy.use_pose_data
+        pose = _extract_pose_from_info(info, backbone, device) if use_pose else None
         pose_dim = pose.shape[-1] if pose is not None else 7
 
         buffer = RolloutBuffer(cfg.training.rollout_length, obs.shape, action_dim, device, pose_dim=pose_dim)
-        txt_goal, goal_state = policy.encode_goals(obs, instruction)
+        policy.reset_context(obs, instruction)
+        value_fn.reset_context(policy.goal_state, policy.txt_goal)
 
         obs_t = torch.from_numpy(obs).float().to(device)
         print(f"Observation shape: {obs.shape}")
@@ -1042,15 +1083,13 @@ def main(cfg: DictConfig):
             value_fn.eval()
             with torch.no_grad():
                 for _ in range(cfg.training.rollout_length):
-                    action_np, log_prob, _, pre_tanh = policy.get_action(
-                        obs_t.unsqueeze(0), txt_goal, goal_state, pose
-                    )
-                    value = value_fn(obs_t.unsqueeze(0), txt_goal, goal_state, pose)
+                    action_np, log_prob, _, pre_tanh = policy.get_action(obs_t.unsqueeze(0), pose)
+                    value = value_fn(obs_t.unsqueeze(0), pose)
 
                     next_obs, reward, done, truncated, info = env.step(action_np)
                     ep_ret      += reward
                     total_steps += 1
-                    pose = _extract_pose_from_info(info, policy, device) if use_pose else None
+                    pose = _extract_pose_from_info(info, backbone, device) if use_pose else None
                     buffer.add(
                         obs_t,
                         pre_tanh.to(device),
@@ -1058,9 +1097,7 @@ def main(cfg: DictConfig):
                         torch.tensor(reward,               device=device),
                         value.squeeze(0),
                         torch.tensor(float(done or truncated), device=device),
-                        pose,
-                        goal_state=goal_state,
-                        txt_goal=txt_goal,
+                        pose
                     )
 
                     if done or truncated:
@@ -1069,8 +1106,9 @@ def main(cfg: DictConfig):
                         ep_ret  = 0.0
                         obs, info = env.reset()
                         obs = np.ascontiguousarray(obs)   # always safe after reset
-                        pose = _extract_pose_from_info(info, policy, device) if use_pose else None
-                        txt_goal, goal_state = policy.encode_goals(obs, instruction)
+                        pose = _extract_pose_from_info(info, backbone, device) if use_pose else None
+                        policy.reset_context(obs, instruction)
+                        value_fn.reset_context(policy.goal_state, policy.txt_goal)
                     else:
                         obs = next_obs
 
@@ -1082,7 +1120,7 @@ def main(cfg: DictConfig):
                     if buffer.full():
                         break
 
-                last_value = value_fn(obs_t.unsqueeze(0), txt_goal, goal_state, pose).squeeze(0)
+                last_value = value_fn(obs_t.unsqueeze(0), pose).squeeze(0)
 
             policy.train()
             value_fn.train()
@@ -1126,7 +1164,7 @@ def main(cfg: DictConfig):
                 ckpt_dir = os.path.join("checkpoints", cfg.experiment.name)
                 os.makedirs(ckpt_dir, exist_ok=True)
                 torch.save({
-                    "policy":      policy.model.state_dict(),
+                    "policy":      policy.backbone.model.state_dict(),
                     "value_fn":    value_fn.state_dict(),
                     "optimizer":   optimizer.state_dict(),
                     "total_steps": total_steps,
@@ -1158,6 +1196,7 @@ def main(cfg: DictConfig):
                 group = collect_grpo_group(
                     env=env,
                     policy=policy,
+                    backbone=backbone,
                     init_state=init_state,
                     group_size=int(cfg.grpo.group_size),
                     max_steps=int(cfg.sim.episode_length),
@@ -1194,7 +1233,7 @@ def main(cfg: DictConfig):
                 ckpt_dir = os.path.join("checkpoints", cfg.experiment.name)
                 os.makedirs(ckpt_dir, exist_ok=True)
                 torch.save({
-                    "policy":      policy.model.state_dict(),
+                    "policy":      policy.backbone.model.state_dict(),
                     "value_fn":    value_fn.state_dict(),
                     "optimizer":   optimizer.state_dict(),
                     "total_steps": total_steps,
@@ -1208,7 +1247,7 @@ def main(cfg: DictConfig):
     ckpt_dir = os.path.join("checkpoints", cfg.experiment.name)
     os.makedirs(ckpt_dir, exist_ok=True)
     torch.save({
-        "policy":   policy.model.state_dict(),
+        "policy":   policy.backbone.model.state_dict(),
         "value_fn": value_fn.state_dict(),
         "cfg":      OmegaConf.to_container(cfg),
     }, os.path.join(ckpt_dir, "transformer_rl_final.pth"))

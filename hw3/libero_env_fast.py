@@ -327,7 +327,7 @@ class FastLIBEROEnv:
         self.current_step += 1
         
         done = False
-        truncated = self.current_step >= self.max_episode_steps
+        truncated = (self.current_step >= self.max_episode_steps)
         if truncated:
             done = True
             
